@@ -19,7 +19,8 @@ type CronJob struct {
 	Schedule string   `json:"schedule"` // cron expr "*/30 * * * *", interval "every:5m", or one-shot "at:2026-04-01T09:00:00"
 	Message  string   `json:"message"`
 	UserID   string   `json:"user_id,omitempty"` // target user (default: first account owner)
-	Agent    string   `json:"agent,omitempty"`    // target agent (default: default agent)
+	Agent    string   `json:"agent,omitempty"`   // target agent (default: default agent)
+	Direct   bool     `json:"direct,omitempty"`  // natural reminder: generate a chat-style message at fire time
 	State    JobState `json:"state"`
 }
 

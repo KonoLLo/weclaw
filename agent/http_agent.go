@@ -44,12 +44,16 @@ type HTTPAgent struct {
 	mu           sync.Mutex
 	history      map[string][]ChatMessage // conversationID -> messages
 	maxHistory   int
+	models       []string
+	stateKey     string
 }
 
 // DefaultHTTPTimeout is the request timeout for HTTP agents when the config
 // does not override it. 60s was too tight for agent turns that include
 // context compaction or a slow model call (observed via WeChat timeouts).
-const DefaultHTTPTimeout = 180 * time.Second
+// File analysis can take longer when the provider is congested, so the ceiling
+// is 300s; normal replies still return in well under a minute.
+const DefaultHTTPTimeout = 300 * time.Second
 
 // HTTPAgentConfig holds configuration for the HTTP agent.
 type HTTPAgentConfig struct {
@@ -60,6 +64,8 @@ type HTTPAgentConfig struct {
 	SystemPrompt string
 	MaxHistory   int
 	Timeout      time.Duration
+	Models       []string
+	Name         string
 }
 
 // NewHTTPAgent creates a new OpenAI-compatible HTTP agent.
@@ -73,7 +79,7 @@ func NewHTTPAgent(cfg HTTPAgentConfig) *HTTPAgent {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = DefaultHTTPTimeout
 	}
-	return &HTTPAgent{
+	ag := &HTTPAgent{
 		endpoint:     cfg.Endpoint,
 		apiKey:       cfg.APIKey,
 		headers:      cfg.Headers,
@@ -82,7 +88,21 @@ func NewHTTPAgent(cfg HTTPAgentConfig) *HTTPAgent {
 		httpClient:   &http.Client{Timeout: cfg.Timeout},
 		history:      make(map[string][]ChatMessage),
 		maxHistory:   cfg.MaxHistory,
+		models:       cfg.Models,
+		stateKey:     cfg.Name,
 	}
+	if ag.stateKey == "" {
+		ag.stateKey = "http"
+	}
+	if sel := loadModelSelection(ag.stateKey); sel != "" {
+		for _, m := range ag.models {
+			if m == sel {
+				ag.model = m
+				break
+			}
+		}
+	}
+	return ag
 }
 
 // Info returns metadata about this agent.
@@ -90,7 +110,7 @@ func (a *HTTPAgent) Info() AgentInfo {
 	return AgentInfo{
 		Name:    "http",
 		Type:    "http",
-		Model:   a.model,
+		Model:   a.currentModel(),
 		Command: a.endpoint,
 	}
 }
@@ -117,7 +137,7 @@ func (a *HTTPAgent) ChatWithAttachments(ctx context.Context, conversationID stri
 	if len(attachments) == 0 {
 		return a.Chat(ctx, conversationID, message)
 	}
-	switch a.model {
+	switch a.currentModel() {
 	case "MiniMax-M3.1-Flash", "MiniMax-M3":
 	default:
 		return a.Chat(ctx, conversationID, MessageWithAttachmentFallback(message, attachments))
@@ -130,13 +150,15 @@ func (a *HTTPAgent) ChatWithAttachments(ctx context.Context, conversationID stri
 	return a.chat(ctx, conversationID, content)
 }
 
-func (a *HTTPAgent) chat(ctx context.Context, conversationID string, content any) (string, error) {
-	a.mu.Lock()
-	messages := a.buildMessages(conversationID, content)
-	a.mu.Unlock()
+// ChatClean answers a one-off prompt without the persona system prompt or
+// conversation history.
+func (a *HTTPAgent) ChatClean(ctx context.Context, message string) (string, error) {
+	return a.complete(ctx, []ChatMessage{{Role: "user", Content: message}})
+}
 
+func (a *HTTPAgent) complete(ctx context.Context, messages []ChatMessage) (string, error) {
 	reqBody := map[string]interface{}{
-		"model":    a.model,
+		"model":    a.currentModel(),
 		"messages": messages,
 	}
 
@@ -186,8 +208,18 @@ func (a *HTTPAgent) chat(ctx context.Context, conversationID string, content any
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no choices in response")
 	}
+	return result.Choices[0].Message.Content, nil
+}
 
-	reply := result.Choices[0].Message.Content
+func (a *HTTPAgent) chat(ctx context.Context, conversationID string, content any) (string, error) {
+	a.mu.Lock()
+	messages := a.buildMessages(conversationID, content)
+	a.mu.Unlock()
+
+	reply, err := a.complete(ctx, messages)
+	if err != nil {
+		return "", err
+	}
 
 	// Save to history
 	a.mu.Lock()

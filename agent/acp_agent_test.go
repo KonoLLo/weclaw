@@ -123,3 +123,16 @@ func assertCodexMethodError(method string) error {
 func (e *rpcError) Error() string {
 	return "agent error: " + e.Message
 }
+
+func TestIsCanceledStopReason(t *testing.T) {
+	for _, reason := range []string{"cancelled", "canceled", "interrupted", "Cancelled"} {
+		if !isCanceledStopReason(reason) {
+			t.Fatalf("isCanceledStopReason(%q) = false, want true", reason)
+		}
+	}
+	for _, reason := range []string{"", "end_turn", "max_tokens", "refusal"} {
+		if isCanceledStopReason(reason) {
+			t.Fatalf("isCanceledStopReason(%q) = true, want false", reason)
+		}
+	}
+}

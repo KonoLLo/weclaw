@@ -94,6 +94,12 @@ type Agent interface {
 	SetCwd(cwd string)
 }
 
+// CleanChatter answers one-off prompts without persona or history. Internal
+// jobs (search summaries) use it to avoid slow role-play turns.
+type CleanChatter interface {
+	ChatClean(ctx context.Context, message string) (string, error)
+}
+
 // Attachment describes a local file attached to a user message.
 type Attachment struct {
 	Path     string
@@ -124,6 +130,12 @@ type ProgressChatAgent interface {
 // single Chat call.
 type AttachmentProgressChatAgent interface {
 	ChatWithAttachmentsAndProgress(ctx context.Context, conversationID string, message string, attachments []Attachment, cb func(ToolProgressEvent)) (string, error)
+}
+
+// TurnCanceler is implemented by agents that can abort an in-progress turn
+// without stopping the whole agent process.
+type TurnCanceler interface {
+	CancelTurn(ctx context.Context, conversationID string) error
 }
 
 func MessageWithAttachmentFallback(message string, attachments []Attachment) string {

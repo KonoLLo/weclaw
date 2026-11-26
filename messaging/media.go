@@ -136,6 +136,15 @@ func sendMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName
 	if resp.Ret != 0 {
 		return fmt.Errorf("send media failed: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
+	if resp.MessageID != "" {
+		mediaPath := ""
+		var size int64
+		if info, err := os.Stat(source); err == nil && info.Mode().IsRegular() {
+			mediaPath = source
+			size = info.Size()
+		}
+		rememberQuoteMedia(client.BotID(), toUserID, "outbound", mediaPath, contentType, fileName, size, resp.MessageID.String())
+	}
 
 	log.Printf("[media] sent %s to %s from %s", contentType, toUserID, source)
 	return nil

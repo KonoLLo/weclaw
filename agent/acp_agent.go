@@ -310,7 +310,8 @@ func (a *ACPAgent) Start(ctx context.Context) error {
 		result, err = a.rpc(initCtx, "initialize", initParams{
 			ProtocolVersion: 1,
 			ClientCapabilities: clientCapabilities{
-				FS: &fsCapabilities{ReadTextFile: true, WriteTextFile: true},
+				// FS capability is declared only if the request handlers exist.
+				FS: nil,
 			},
 		})
 	}
@@ -524,6 +525,13 @@ func (a *ACPAgent) ChatWithAttachmentsAndProgress(ctx context.Context, conversat
 				}
 				return "", fmt.Errorf("prompt error: %w", done.err)
 			}
+			var promptRes promptResult
+			if len(done.result) > 0 && json.Unmarshal(done.result, &promptRes) == nil && isCanceledStopReason(promptRes.StopReason) {
+				return "", context.Canceled
+			}
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			result := strings.TrimSpace(strings.Join(textParts, ""))
 			if result == "" {
 				// Try extracting from prompt result (some agents return content here)
@@ -535,6 +543,27 @@ func (a *ACPAgent) ChatWithAttachmentsAndProgress(ctx context.Context, conversat
 			return result, nil
 		}
 	}
+}
+
+func isCanceledStopReason(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return strings.Contains(reason, "cancel") || reason == "interrupted"
+}
+
+// CancelTurn asks the ACP agent to abort the current session/prompt turn.
+func (a *ACPAgent) CancelTurn(ctx context.Context, conversationID string) error {
+	a.mu.Lock()
+	started := a.started
+	protocol := a.protocol
+	sessionID := a.sessions[conversationID]
+	a.mu.Unlock()
+	if !started || protocol != protocolLegacyACP || sessionID == "" {
+		return nil
+	}
+	if _, err := a.rpc(ctx, "session/cancel", map[string]string{"sessionId": sessionID}); err != nil {
+		return fmt.Errorf("session/cancel: %w", err)
+	}
+	return nil
 }
 
 func (a *ACPAgent) getOrCreateSession(ctx context.Context, conversationID string) (string, bool, error) {

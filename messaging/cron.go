@@ -110,6 +110,11 @@ func (s *CronScheduler) executeJob(ctx context.Context, job CronJob) {
 		userID = s.targetUser
 	}
 
+	if job.Direct {
+		s.executeReminderJob(ctx, job, userID)
+		return
+	}
+
 	ag := s.getAgent(job.Agent)
 	if ag == nil {
 		log.Printf("[cron] no agent available for job %q, will retry", job.Name)
@@ -142,6 +147,45 @@ func (s *CronScheduler) executeJob(ctx context.Context, job CronJob) {
 	}
 
 	s.recordResult(job, "ok", "")
+}
+
+// executeReminderJob triggers a chat-style reminder. If the agent is
+// unavailable, a deterministic one-line message is used instead.
+func (s *CronScheduler) executeReminderJob(ctx context.Context, job CronJob, userID string) {
+	text := strings.TrimSpace(job.Message)
+	if text == "" {
+		text = strings.TrimSpace(strings.TrimPrefix(job.Name, "提醒："))
+	}
+	if s.client == nil || userID == "" {
+		log.Printf("[cron] reminder %q has no send target", job.Name)
+		s.recordResult(job, "error", "no send target")
+		return
+	}
+	message := s.reminderMessage(ctx, job, userID, text)
+	if err := SendTextReply(ctx, s.client, userID, message, "", ""); err != nil {
+		log.Printf("[cron] failed to send reminder %q: %v", job.Name, err)
+		if qerr := EnqueuePendingNotification(userID, message); qerr != nil {
+			log.Printf("[cron] failed to queue reminder %q: %v", job.Name, qerr)
+			s.recordResult(job, "error", "send failed: "+err.Error())
+			return
+		}
+		log.Printf("[cron] reminder %q queued for %s", job.Name, userID)
+	}
+	s.recordResult(job, "ok", "")
+}
+
+func (s *CronScheduler) reminderMessage(ctx context.Context, job CronJob, userID, text string) string {
+	if s.getAgent != nil && strings.TrimSpace(text) != "" {
+		if ag := s.getAgent(job.Agent); ag != nil {
+			reply, err := ag.Chat(ctx, userID, reminderChatPrompt(text))
+			if err != nil {
+				log.Printf("[cron] reminder agent error for job %q: %v", job.Name, err)
+			} else if reply = strings.TrimSpace(reply); reply != "" {
+				return reply
+			}
+		}
+	}
+	return formatChattyReminder(text)
 }
 
 func (s *CronScheduler) recordResult(job CronJob, status, errMsg string) {

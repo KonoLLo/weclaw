@@ -40,10 +40,22 @@ type Handler struct {
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map   // map[userID]contextToken
-	saveDir       string     // directory to save images/files to
-	seenMsgs      sync.Map   // map[int64]time.Time — dedup by message_id
-	cronStore     *CronStore // cron job store (nil if not configured)
+	contextTokens sync.Map          // map[userID]contextToken
+	saveDir       string            // directory to save images/files to
+	seenMsgs      sync.Map          // map[int64]time.Time — dedup by message_id
+	pendingFiles  sync.Map          // map[userID]pendingIncomingFile — last upload waiting for a question
+	cronStore     *CronStore        // cron job store (nil if not configured)
+	memoryStore   *MemoryStore      // long-term per-user notes (nil = disabled)
+	allowedUsers  []string          // when non-empty, only these WeChat user IDs are served
+	imageGen      *agent.ImageGen   // text-to-image generator (nil = /图 disabled)
+	videoGen      *agent.VideoGen   // text-to-video generator (nil = /视频 disabled)
+	webSearch     agent.Searcher    // DuckDuckGo or Tavily (nil = disabled)
+	tts           *agent.TTS        // edge-tts client (nil = voice disabled)
+	workspace     *WorkspaceManager // per-user code workspace (nil = disabled)
+
+	tasksMu sync.Mutex
+	tasks   map[string]map[uint64]runningTask
+	taskSeq uint64
 }
 
 // ContextTokens exposes the per-user context-token cache (used by the
@@ -103,6 +115,34 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 	}
 }
 
+// SetAllowedUsers restricts which WeChat users are served. An empty list keeps
+// the upstream behaviour of serving anyone, so existing installs are unaffected.
+func (h *Handler) SetAllowedUsers(users []string) { h.allowedUsers = users }
+
+// SetImageGen enables /图 and the drawing keywords. Nil leaves them off.
+func (h *Handler) SetImageGen(g *agent.ImageGen) { h.imageGen = g }
+
+// SetVideoGen enables /视频 and the video keywords. Nil leaves them off.
+func (h *Handler) SetVideoGen(g *agent.VideoGen) { h.videoGen = g }
+
+// SetWebSearch enables /s and the search keywords.
+func (h *Handler) SetWebSearch(w agent.Searcher) { h.webSearch = w }
+
+// SetTTS enables /语音 and the voice keywords (nil = disabled).
+func (h *Handler) SetTTS(t *agent.TTS) { h.tts = t }
+
+// SetWorkspaceManager enables workspace commands (nil = disabled).
+func (h *Handler) SetWorkspaceManager(m *WorkspaceManager) { h.workspace = m }
+
+func (h *Handler) isAllowed(userID string) bool {
+	for _, u := range h.allowedUsers {
+		if u == userID {
+			return true
+		}
+	}
+	return false
+}
+
 // SetSaveDir sets the directory for saving images and files.
 func (h *Handler) SetSaveDir(dir string) {
 	h.saveDir = dir
@@ -111,6 +151,11 @@ func (h *Handler) SetSaveDir(dir string) {
 // SetCronStore sets the cron job store for /cron commands.
 func (h *Handler) SetCronStore(store *CronStore) {
 	h.cronStore = store
+}
+
+// SetMemoryStore enables /记住, /记忆 and /忘记.
+func (h *Handler) SetMemoryStore(store *MemoryStore) {
+	h.memoryStore = store
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -340,6 +385,12 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	}
 
+	// Serve only the owner list when configured; stay silent otherwise so an
+	// unlisted sender learns nothing about the bot.
+	if len(h.allowedUsers) > 0 && !h.isAllowed(msg.FromUserID) {
+		log.Printf("[handler] ignored message from unlisted user %s", msg.FromUserID)
+		return
+	}
 	// Deduplicate by message_id to avoid processing the same message multiple times
 	// (voice messages may trigger multiple finish-state updates)
 	if msg.MessageID != 0 {
@@ -368,6 +419,9 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			log.Printf("[handler] voice transcription from %s: %q", msg.FromUserID, truncate(text, 80))
 		}
 	}
+	if strings.TrimSpace(text) != "" {
+		rememberQuoteMessage(client.BotID(), msg.FromUserID, "inbound", text, quoteIDsForMessage(msg)...)
+	}
 	images := extractImages(msg)
 	if len(images) > 0 {
 		h.handleImageMessage(ctx, client, msg, text, images)
@@ -377,14 +431,21 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		h.handleVideoMessage(ctx, client, msg, text, video)
 		return
 	}
-	if text == "" {
-		// Check for file message
-		if file := extractFile(msg); file != nil && h.saveDir != "" {
-			h.handleFileSave(ctx, client, msg, file)
+	if file := extractFile(msg); file != nil {
+		// Save and index the body even when the same message carries a caption;
+		// the caption keeps flowing so it can ask about the file right away.
+		h.handleIncomingFile(ctx, client, msg, file, strings.TrimSpace(text) == "")
+		if strings.TrimSpace(text) == "" {
 			return
 		}
-		log.Printf("[handler] received non-text message from %s, skipping", msg.FromUserID)
-		return
+	}
+	if text == "" {
+		if findQuoteItem(msg) != nil {
+			text = "请看看我引用的这条消息。"
+		} else {
+			log.Printf("[handler] received non-text message from %s, skipping", msg.FromUserID)
+			return
+		}
 	}
 
 	log.Printf("[handler] received from %s: %q", msg.FromUserID, truncate(text, 80))
@@ -392,25 +453,13 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
 
-	// Intercept URLs: save to Linkhoard directly without AI agent
 	trimmed := strings.TrimSpace(text)
-	if h.saveDir != "" && IsURL(trimmed) {
-		rawURL := ExtractURL(trimmed)
-		if rawURL != "" {
-			log.Printf("[handler] saving URL to linkhoard: %s", rawURL)
-			title, err := SaveLinkToLinkhoard(ctx, h.saveDir, rawURL)
-			var reply string
-			if err != nil {
-				log.Printf("[handler] link save failed: %v", err)
-				reply = fmt.Sprintf("保存失败: %v", err)
-			} else {
-				reply = fmt.Sprintf("已保存: %s", title)
-			}
-			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-			}
-			return
-		}
+
+	// The monitor normally delivers /stop out of band; this is the fallback for
+	// callers that invoke the handler directly.
+	if trimmed == "/stop" {
+		h.handleStopCommand(ctx, client, msg, clientID)
+		return
 	}
 
 	// Keep bridge-only commands like /cwd in WeClaw, but let Hermes own its
@@ -437,6 +486,43 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 	}
 
+	if h.handleMemoryCommand(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+	if h.handleReminderRequest(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+	if query, ok := detectSearchRequest(trimmed); ok {
+		h.handleSearchRequest(ctx, client, msg, query, clientID)
+		return
+	}
+	if prompt, ok := detectImageRequest(textWithoutSize(trimmed)); ok {
+		size, _ := extractImageSize(trimmed)
+		h.handleImageRequest(ctx, client, msg, prompt, size, clientID)
+		return
+	}
+	if prompt, ok := detectVideoRequest(textWithoutSize(trimmed)); ok {
+		size, _ := extractVideoSize(trimmed)
+		h.handleVideoRequest(ctx, client, msg, prompt, size, clientID)
+		return
+	}
+	if h.handleVoiceCommand(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+	if _, ok := parseSearchEngineArgs(trimmed); ok {
+		reply := h.handleSearchEngineCommand(trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send /se reply: %v", err)
+		}
+		return
+	}
+	if trimmed == "/mod" || strings.HasPrefix(trimmed, "/mod ") || strings.HasPrefix(trimmed, "/mod-") {
+		reply := h.handleModCommand(ctx, trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send /mod reply: %v", err)
+		}
+		return
+	}
 	if strings.HasPrefix(trimmed, "/cwd") {
 		reply := h.handleCwd(ctx, msg.FromUserID, trimmed)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
@@ -452,6 +538,17 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send cron reply to %s: %v", msg.FromUserID, err)
 		}
+		return
+	}
+
+	if h.handleWorkspaceCommand(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+	if h.handleExportCommand(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+
+	if h.handleLinkText(ctx, client, msg, trimmed, clientID) {
 		return
 	}
 
@@ -512,6 +609,149 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	}
 }
 
+// HandleMessages processes a merged group from one sender. Plain text and
+// images are folded into one agent turn; commands, quotes, files and videos
+// keep their original per-message semantics.
+func (h *Handler) HandleMessages(ctx context.Context, client *ilink.Client, msgs []ilink.WeixinMessage) {
+	filtered := make([]ilink.WeixinMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg.MessageType != ilink.MessageTypeUser || msg.MessageState != ilink.MessageStateFinish {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	if len(filtered) == 1 {
+		h.HandleMessage(ctx, client, filtered[0])
+		return
+	}
+
+	firstUser := filtered[0].FromUserID
+	for _, msg := range filtered[1:] {
+		if msg.FromUserID != firstUser {
+			for _, item := range filtered {
+				h.HandleMessage(ctx, client, item)
+			}
+			return
+		}
+	}
+	if h.batchNeedsSequential(filtered) {
+		for _, item := range filtered {
+			if ctx.Err() != nil {
+				return
+			}
+			h.HandleMessage(ctx, client, item)
+		}
+		return
+	}
+
+	h.handleMergedMessages(ctx, client, filtered)
+}
+
+func (h *Handler) batchNeedsSequential(msgs []ilink.WeixinMessage) bool {
+	for _, msg := range msgs {
+		if findQuoteItem(msg) != nil || extractVideo(msg) != nil || extractFile(msg) != nil {
+			return true
+		}
+		if text := strings.TrimSpace(extractText(msg)); strings.HasPrefix(text, "/") || strings.HasPrefix(text, "@") {
+			return true
+		}
+		for _, item := range msg.ItemList {
+			if item.Type == ilink.ItemTypeVoice && (item.VoiceItem == nil || strings.TrimSpace(item.VoiceItem.Text) == "") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) handleMergedMessages(ctx context.Context, client *ilink.Client, msgs []ilink.WeixinMessage) {
+	if len(h.allowedUsers) > 0 && !h.isAllowed(msgs[0].FromUserID) {
+		log.Printf("[handler] ignored merged messages from unlisted user %s", msgs[0].FromUserID)
+		return
+	}
+
+	clientID := NewClientID()
+	anchor := msgs[len(msgs)-1]
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].ContextToken != "" {
+			anchor.ContextToken = msgs[i].ContextToken
+			break
+		}
+	}
+	if anchor.ContextToken != "" {
+		h.contextTokens.Store(anchor.FromUserID, anchor.ContextToken)
+		if err := ilink.SaveContextToken(client.BotID(), anchor.FromUserID, anchor.ContextToken); err != nil {
+			log.Printf("[handler] failed to save context token for %s: %v", anchor.FromUserID, err)
+		}
+	}
+	go FlushPendingNotifications(ctx, client, anchor.FromUserID, anchor.ContextToken)
+
+	var textParts []string
+	var attachments []agent.Attachment
+	for _, msg := range msgs {
+		text := extractText(msg)
+		if text == "" {
+			text = extractVoiceText(msg)
+		}
+		if strings.TrimSpace(text) != "" {
+			textParts = append(textParts, strings.TrimSpace(text))
+			rememberQuoteMessage(client.BotID(), msg.FromUserID, "inbound", text, quoteIDsForMessage(msg)...)
+		}
+		for _, img := range extractImages(msg) {
+			attachment, err := h.saveInboundImage(ctx, msg, img, h.mediaSaveDir())
+			if err != nil {
+				log.Printf("[handler] failed to save merged image from %s: %v", msg.FromUserID, err)
+				h.sendFailureNotice(ctx, client, anchor, fmt.Sprintf("Failed to save image: %v", err), clientID)
+				return
+			}
+			attachments = append(attachments, attachment)
+			rememberInboundMedia(client.BotID(), msg, attachment.Path, attachment.MIMEType, attachment.Name)
+		}
+	}
+
+	mergedText := strings.Join(textParts, "\n\n")
+	if mergedText == "" {
+		if len(attachments) > 1 {
+			mergedText = "Please analyze the attached images."
+		} else {
+			mergedText = "Please analyze the attached image."
+		}
+	}
+	log.Printf("[handler] merged %d messages from %s: %q (%d image(s))", len(msgs), anchor.FromUserID, truncate(mergedText, 120), len(attachments))
+
+	go func() {
+		if err := SendTypingState(ctx, client, anchor.FromUserID, anchor.ContextToken); err != nil {
+			log.Printf("[handler] failed to send typing state: %v", err)
+		}
+	}()
+
+	h.mu.RLock()
+	defaultName := h.defaultName
+	h.mu.RUnlock()
+
+	var reply string
+	if ag := h.getDefaultAgent(); ag != nil {
+		var err error
+		reply, err = h.chatWithAgentAttachments(ctx, ag, client, anchor, mergedText, attachments)
+		if err != nil {
+			if canceledReply(err) {
+				log.Printf("[handler] merged turn canceled for %s", anchor.FromUserID)
+				return
+			}
+			reply = fmt.Sprintf("Error: %v", err)
+		}
+	} else if len(attachments) > 0 {
+		reply = fmt.Sprintf("Saved image: %s", attachments[0].Path)
+	} else {
+		reply = "[echo] " + mergedText
+	}
+
+	h.sendReplyWithMedia(ctx, client, anchor, defaultName, reply, clientID)
+}
+
 // sendToDefaultAgent sends the message to the default agent and replies.
 func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, text, clientID string) {
 	go func() {
@@ -530,6 +770,10 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 		var err error
 		reply, err = h.chatWithAgent(ctx, ag, client, msg, text)
 		if err != nil {
+			if canceledReply(err) {
+				log.Printf("[handler] turn canceled for %s", msg.FromUserID)
+				return
+			}
 			reply = fmt.Sprintf("Error: %v", err)
 		}
 	} else {
@@ -552,6 +796,10 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 
 	reply, err := h.chatWithAgent(ctx, ag, client, msg, message)
 	if err != nil {
+		if canceledReply(err) {
+			log.Printf("[handler] turn canceled for %s (agent %s)", msg.FromUserID, name)
+			return
+		}
 		reply = fmt.Sprintf("Error: %v", err)
 	}
 	h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
@@ -561,8 +809,9 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 // Each reply is sent as a separate message with the agent name prefix.
 func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, names []string, message string) {
 	type result struct {
-		name  string
-		reply string
+		name     string
+		reply    string
+		canceled bool
 	}
 
 	ch := make(chan result, len(names))
@@ -576,6 +825,10 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 			}
 			reply, err := h.chatWithAgent(ctx, ag, client, msg, message)
 			if err != nil {
+				if canceledReply(err) {
+					ch <- result{name: n, canceled: true}
+					return
+				}
 				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
 				return
 			}
@@ -586,6 +839,9 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 	// Send replies as they arrive
 	for range names {
 		r := <-ch
+		if r.canceled {
+			continue
+		}
 		reply := fmt.Sprintf("[%s] %s", r.name, r.reply)
 		clientID := NewClientID()
 		h.sendReplyWithMedia(ctx, client, msg, r.name, reply, clientID)
@@ -596,7 +852,7 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, agentName, reply, clientID string) {
 	imageURLs := ExtractImageURLs(reply)
 	attachmentPaths := extractLocalAttachmentPaths(reply)
-	allowedRoots := h.allowedAttachmentRoots(agentName)
+	allowedRoots := h.allowedAttachmentRoots(agentName, msg.FromUserID)
 
 	var sentPaths []string
 	var failedPaths []string
@@ -614,10 +870,15 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 		sentPaths = append(sentPaths, attachmentPath)
 	}
 
+	if !errorNoticesEnabled.Load() {
+		failedPaths = nil
+	}
 	reply = rewriteReplyWithAttachmentResults(reply, sentPaths, failedPaths)
 
-	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	if strings.TrimSpace(reply) != "" {
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+		}
 	}
 
 	for _, imgURL := range imageURLs {
@@ -627,7 +888,7 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 	}
 }
 
-func (h *Handler) allowedAttachmentRoots(agentName string) []string {
+func (h *Handler) allowedAttachmentRoots(agentName, userID string) []string {
 	roots := []string{defaultAttachmentWorkspace()}
 
 	h.mu.RLock()
@@ -636,6 +897,11 @@ func (h *Handler) allowedAttachmentRoots(agentName string) []string {
 
 	if agentDir != "" {
 		roots = append(roots, agentDir)
+	}
+	if h.workspace != nil {
+		if wsRoot := h.workspace.CurrentRoot(userID); wsRoot != "" {
+			roots = append(roots, wsRoot)
+		}
 	}
 
 	return roots
@@ -649,12 +915,27 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, client *ili
 func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, client *ilink.Client, msg ilink.WeixinMessage, message string, attachments []agent.Attachment) (string, error) {
 	info := ag.Info()
 	userID := msg.FromUserID
+	taskCtx, finish := h.beginTask(ctx, userID, "AI 回复", func(stopCtx context.Context) {
+		if canceller, ok := ag.(agent.TurnCanceler); ok {
+			if cancelErr := canceller.CancelTurn(stopCtx, userID); cancelErr != nil {
+				log.Printf("[stop] cancel agent turn for %s: %v", userID, cancelErr)
+			}
+		}
+	})
+	defer finish()
+
+	if len(attachments) == 0 && !strings.HasPrefix(strings.TrimSpace(message), "/") {
+		message = h.attachPendingIncomingFile(userID, info.Type, message)
+	}
 	log.Printf("[handler] dispatching to agent (%s) for %s", info, userID)
 
 	start := time.Now()
 	if len(attachments) == 0 {
-		if reply, handled, err := h.handleHermesNativeCommand(ctx, ag, userID, message); handled {
+		if reply, handled, err := h.handleHermesNativeCommand(taskCtx, ag, userID, message); handled {
 			elapsed := time.Since(start)
+			if taskCtx.Err() != nil {
+				return "", context.Canceled
+			}
 			if err != nil {
 				log.Printf("[handler] hermes native command error (%s, elapsed=%s): %v", info, elapsed, err)
 				return "", err
@@ -664,21 +945,37 @@ func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, 
 		}
 	}
 
+	if strings.TrimSpace(message) != "" && !strings.HasPrefix(strings.TrimSpace(message), "/") {
+		if mem := h.memoryPromptFor(userID); mem != "" {
+			message = mem + "\n\n" + message
+			log.Printf("[memory] injected saved notes for %s", userID)
+		}
+		if quotePrompt, quoteAttachments := h.quoteContextForMessage(taskCtx, client, msg); quotePrompt != "" {
+			message = quotePrompt + "\n\n" + message
+			attachments = append(attachments, quoteAttachments...)
+			log.Printf("[quote] injected quoted context for %s (%d chars, %d attachment(s))", userID, len(quotePrompt), len(quoteAttachments))
+		}
+	}
+
 	var reply string
 	var err error
 	if attachmentProgressAgent, ok := ag.(agent.AttachmentProgressChatAgent); ok {
-		reply, err = attachmentProgressAgent.ChatWithAttachmentsAndProgress(ctx, userID, message, attachments, h.toolProgressForwarder(ctx, client, msg))
+		reply, err = attachmentProgressAgent.ChatWithAttachmentsAndProgress(taskCtx, userID, message, attachments, h.toolProgressForwarder(ctx, client, msg))
 	} else if attachmentAgent, ok := ag.(agent.AttachmentChatAgent); ok {
-		reply, err = attachmentAgent.ChatWithAttachments(ctx, userID, message, attachments)
+		reply, err = attachmentAgent.ChatWithAttachments(taskCtx, userID, message, attachments)
 	} else if progressAgent, ok := ag.(agent.ProgressChatAgent); ok {
 		message = agent.MessageWithAttachmentFallback(message, attachments)
-		reply, err = progressAgent.ChatWithProgress(ctx, userID, message, h.toolProgressForwarder(ctx, client, msg))
+		reply, err = progressAgent.ChatWithProgress(taskCtx, userID, message, h.toolProgressForwarder(ctx, client, msg))
 	} else {
 		message = agent.MessageWithAttachmentFallback(message, attachments)
-		reply, err = ag.Chat(ctx, userID, message)
+		reply, err = ag.Chat(taskCtx, userID, message)
 	}
 	elapsed := time.Since(start)
 
+	if taskCtx.Err() != nil {
+		log.Printf("[handler] agent turn canceled (%s, elapsed=%s)", info, elapsed)
+		return "", context.Canceled
+	}
 	if err != nil {
 		log.Printf("[handler] agent error (%s, elapsed=%s): %v", info, elapsed, err)
 		return "", err
@@ -809,6 +1106,7 @@ func (h *Handler) resetDefaultSession(ctx context.Context, userID string) string
 	if ag == nil {
 		return "No agent running."
 	}
+	h.pendingFiles.Delete(userID)
 	name := ag.Info().Name
 	sessionID, err := ag.ResetSession(ctx, userID)
 	if err != nil {
@@ -910,55 +1208,117 @@ func (h *Handler) buildStatus() string {
 	}
 
 	info := ag.Info()
-	return fmt.Sprintf("agent: %s\ntype: %s\nmodel: %s", h.defaultName, info.Type, info.Model)
+	return fmt.Sprintf("agent: %s\n\ntype: %s\n\nmodel: %s", h.defaultName, info.Type, info.Model)
+}
+
+// WeChat folds single newlines into one paragraph; only blank lines render as
+// line breaks.
+func wechatLines(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n\n")
 }
 
 func buildHelpText() string {
-	return `Available commands:
-@agent or /agent - Switch default agent
-@agent msg or /agent msg - Send to a specific agent
-@a @b msg - Broadcast to multiple agents
-/new or /clear - Start a new session
-/cwd /path - Switch workspace directory
-/cron list|add|delete|enable|disable - Manage scheduled tasks
-/info - Show current agent info
-/help - Show this help message
+	return wechatLines(`WeClaw 命令帮助
 
-Aliases: /cc(claude) /cx(codex) /hm(hermes) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`
+【基本】
+@agent 或 /agent - 切换默认 AI 助手
+@agent 消息 或 /agent 消息 - 把消息发给指定 AI 助手
+@a @b 消息 - 同时发给多个 AI 助手
+/new 或 /clear - 开始新会话
+/stop - 中止正在运行的长任务
+/cwd /路径 - 切换工作目录
+
+【代码工作区】
+/ws [list|new N|use N] - 列出、新建或切换代码工作区
+/ws import <公开 GitHub 链接> - 导入公开仓库；先发 zip 再发 /ws import 可导入压缩包
+/code <任务> - 在当前工作区写代码或改代码
+/files [目录] - 列出工作区文件
+/cat <路径> - 查看工作区文件内容
+/write <路径> <内容> - 写入工作区文件
+/run <命令> - 在工作区执行命令（需开启 allow_shell）
+/diff - 查看工作区改动
+/pack - 打包工作区并回传
+/send <路径> - 回传工作区文件
+
+【定时与提醒】
+/cron list|add|delete|enable|disable - 管理定时任务
+提醒我明天上午9点交报告 - 一次性自然语言提醒
+每天下午5点提醒我写日报 - 重复自然语言提醒
+
+【长期记忆】
+/记住 <内容> - 保存长期记忆（最多 50 条）
+/记忆 - 查看已保存的记忆
+/忘记 <编号|关键词> - 删除一条记忆
+
+【阅读与文件】
+/读 <链接> 或直接发链接 - 读取网页并总结
+直接发文件 - 分析文本/代码、Word、Excel，不支持 PDF
+/word [内容] - 导出 Word；不带内容时用刚上传的文件
+/excel [内容] - 导出 Excel；单元格用 | 分列
+/导出 word|excel <内容> - 中文写法，效果同上
+
+【图片与视频】
+/图 <描述> 或 画一只猫 - 生成图片（免费）
+/视频 <描述> - 生成视频（免费）
+
+【搜索与模型】
+/s <关键词> 或 搜一下… - 联网搜索（默认 DuckDuckGo）
+/se [list|N|name] - 查看或切换搜索引擎
+/mod [list|N|name] - 查看或切换模型（仅 HTTP 助手）
+/mod-t - 测试当前可用模型
+
+【语音】
+/语音 <文字> 或 用语音说… - 文字转语音，发送可播放的视频气泡（默认晓晓）
+/音色 - 查看音色；发 /语音 <音色> <文字> 可指定
+
+【信息】
+/info - 查看当前 AI 助手信息
+/help - 查看本帮助
+
+助手别名：/cc(claude) /cx(codex) /hm(hermes) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`)
 }
 
 func buildHermesHelpText() string {
-	return `Hermes commands:
-/help - Show Hermes command help
-/skills - Show Hermes skills hub commands
-/skills <subcommand> - Run Hermes skills subcommands
-/new or /clear - Start a fresh Hermes session
-/info - Show Hermes status
-/version - Show Hermes version
-/model - Hermes model command
-/tools - Hermes tools list
-/context - Hermes context summary
-/reset - Hermes reset command
-/compact - Hermes compact command
+	return wechatLines(`Hermes 命令帮助
 
-When Hermes is the active agent, these commands are handled by Hermes.`
+/help - 查看 Hermes 命令帮助
+/skills - 查看技能中心命令
+/skills <子命令> - 执行技能中心子命令
+/new 或 /clear - 开始新的 Hermes 会话
+/info - 查看 Hermes 状态
+/version - 查看 Hermes 版本
+/model - Hermes 模型命令
+/tools - 查看 Hermes 工具列表
+/context - 查看 Hermes 上下文摘要
+/reset - 重置 Hermes
+/compact - 压缩 Hermes 上下文
+
+Hermes 是当前助手时，这些命令由 Hermes 处理。`)
 }
 
 func buildHermesSkillsHelpText() string {
-	return `Skills Hub Commands:
+	return wechatLines(`Hermes 技能中心命令
 
-  browse [--source official]   Browse all available skills (paginated)
-  search <query>               Search registries for skills
-  install <identifier>         Install a skill (with security scan)
-  inspect <identifier>         Preview a skill without installing
-  list [--source hub|builtin|local] List installed skills
-  check [name]                 Check hub skills for upstream updates
-  update [name]                Update hub skills with upstream changes
-  audit [name]                 Re-scan hub skills for security
-  uninstall <name>             Remove a hub-installed skill
-  publish <path> --repo <r>    Publish a skill to GitHub via PR
-  snapshot export|import       Export/import skill configurations
-  tap list|add|remove          Manage skill sources`
+browse [--source official] - 浏览全部可用技能（分页）
+search <关键词> - 搜索技能
+install <标识> - 安装技能（含安全扫描）
+inspect <标识> - 预览技能，不安装
+list [--source hub|builtin|local] - 查看已安装技能
+check [名称] - 检查技能的上游更新
+update [名称] - 更新技能到上游版本
+audit [名称] - 重新扫描技能安全
+uninstall <名称> - 卸载从技能中心安装的技能
+publish <路径> --repo <仓库> - 通过 PR 发布技能到 GitHub
+snapshot export|import - 导出或导入技能配置
+tap list|add|remove - 管理技能来源`)
 }
 
 func extractText(msg ilink.WeixinMessage) string {
@@ -998,58 +1358,6 @@ func extractVoiceText(msg ilink.WeixinMessage) string {
 	return ""
 }
 
-func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, fileItem *ilink.FileItem) {
-	clientID := NewClientID()
-	log.Printf("[handler] received file from %s, saving to %s", msg.FromUserID, h.saveDir)
-
-	var data []byte
-	var err error
-
-	if fileItem.Media != nil && fileItem.Media.EncryptQueryParam != "" {
-		data, err = DownloadFileFromCDN(ctx, fileItem.Media.EncryptQueryParam, fileItem.Media.AESKey)
-	} else {
-		log.Printf("[handler] file has no media info from %s", msg.FromUserID)
-		return
-	}
-
-	if err != nil {
-		log.Printf("[handler] failed to download file from %s: %v", msg.FromUserID, err)
-		reply := fmt.Sprintf("Failed to save file: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
-		return
-	}
-
-	fileName := sanitizeIncomingFileName(fileItem.FileName)
-	if fileName == "" {
-		fileName = fmt.Sprintf("file_%s", time.Now().Format("20060102-150405"))
-	}
-	// Prefix with timestamp to avoid collision
-	fileName = fmt.Sprintf("%s_%s", time.Now().Format("150405"), fileName)
-	filePath := filepath.Join(h.saveDir, fileName)
-
-	if err := os.MkdirAll(h.saveDir, 0o755); err != nil {
-		log.Printf("[handler] failed to create save dir: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
-		log.Printf("[handler] failed to write file: %v", err)
-		reply := fmt.Sprintf("Failed to save file: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
-		return
-	}
-
-	sidecarPath := filePath + ".sidecar.md"
-	sidecarContent := fmt.Sprintf("---\nid: %s\n---\n", uuid.New().String())
-	if err := os.WriteFile(sidecarPath, []byte(sidecarContent), 0o644); err != nil {
-		log.Printf("[handler] failed to write sidecar: %v", err)
-	}
-
-	log.Printf("[handler] saved file to %s (%d bytes)", filePath, len(data))
-	sysMsg := fmt.Sprintf("[System] User uploaded a file to the workspace: %s", filePath)
-	h.sendToDefaultAgent(ctx, client, msg, sysMsg, clientID)
-}
-
 func (h *Handler) handleImageMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, text string, images []*ilink.ImageItem) {
 	clientID := NewClientID()
 	saveDir := h.mediaSaveDir()
@@ -1060,11 +1368,11 @@ func (h *Handler) handleImageMessage(ctx context.Context, client *ilink.Client, 
 		attachment, err := h.saveInboundImage(ctx, msg, img, saveDir)
 		if err != nil {
 			log.Printf("[handler] failed to save inbound image from %s: %v", msg.FromUserID, err)
-			reply := fmt.Sprintf("Failed to save image: %v", err)
-			_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+			h.sendFailureNotice(ctx, client, msg, fmt.Sprintf("Failed to save image: %v", err), clientID)
 			return
 		}
 		attachments = append(attachments, attachment)
+		rememberInboundMedia(client.BotID(), msg, attachment.Path, attachment.MIMEType, attachment.Name)
 	}
 
 	if strings.TrimSpace(text) == "" {
@@ -1087,6 +1395,10 @@ func (h *Handler) handleImageMessage(ctx context.Context, client *ilink.Client, 
 		var err error
 		reply, err = h.chatWithAgentAttachments(ctx, ag, client, msg, text, attachments)
 		if err != nil {
+			if canceledReply(err) {
+				log.Printf("[handler] media turn canceled for %s", msg.FromUserID)
+				return
+			}
 			reply = fmt.Sprintf("Error: %v", err)
 		}
 	} else {
@@ -1102,10 +1414,8 @@ func (h *Handler) saveInboundImage(ctx context.Context, msg ilink.WeixinMessage,
 
 	if img.URL != "" {
 		data, _, err = downloadFile(ctx, img.URL)
-	} else if img.Media != nil && img.Media.EncryptQueryParam != "" {
-		data, err = DownloadFileFromCDN(ctx, img.Media.EncryptQueryParam, img.Media.AESKey)
 	} else {
-		return agent.Attachment{}, fmt.Errorf("image has no URL or media info")
+		data, err = DownloadMediaInfo(ctx, img.Media, img.AESKey)
 	}
 	if err != nil {
 		return agent.Attachment{}, err
@@ -1152,16 +1462,15 @@ func (h *Handler) handleVideoMessage(ctx context.Context, client *ilink.Client, 
 	saveDir := h.mediaSaveDir()
 	log.Printf("[handler] received video from %s, saving to %s", msg.FromUserID, saveDir)
 
-	if video.Media == nil || video.Media.EncryptQueryParam == "" {
+	if video.Media == nil || (video.Media.EncryptQueryParam == "" && video.Media.FullURL == "") {
 		log.Printf("[handler] video has no media info from %s", msg.FromUserID)
 		return
 	}
 
-	data, err := DownloadFileFromCDN(ctx, video.Media.EncryptQueryParam, video.Media.AESKey)
+	data, err := DownloadMediaInfo(ctx, video.Media, "")
 	if err != nil {
 		log.Printf("[handler] failed to download video from %s: %v", msg.FromUserID, err)
-		reply := fmt.Sprintf("Failed to save video: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendFailureNotice(ctx, client, msg, fmt.Sprintf("Failed to save video: %v", err), clientID)
 		return
 	}
 
@@ -1173,11 +1482,11 @@ func (h *Handler) handleVideoMessage(ctx context.Context, client *ilink.Client, 
 	}
 	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		log.Printf("[handler] failed to write video: %v", err)
-		reply := fmt.Sprintf("Failed to save video: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendFailureNotice(ctx, client, msg, fmt.Sprintf("Failed to save video: %v", err), clientID)
 		return
 	}
 	log.Printf("[handler] saved inbound video to %s (%d bytes)", filePath, len(data))
+	rememberInboundMedia(client.BotID(), msg, filePath, "video/mp4", fileName)
 
 	if strings.TrimSpace(text) == "" {
 		text = "Please analyze the attached video."
@@ -1198,6 +1507,10 @@ func (h *Handler) handleVideoMessage(ctx context.Context, client *ilink.Client, 
 	if ag := h.getDefaultAgent(); ag != nil {
 		reply, err = h.chatWithAgentAttachments(ctx, ag, client, msg, text, attachments)
 		if err != nil {
+			if canceledReply(err) {
+				log.Printf("[handler] media turn canceled for %s", msg.FromUserID)
+				return
+			}
 			reply = fmt.Sprintf("Error: %v", err)
 		}
 	} else {

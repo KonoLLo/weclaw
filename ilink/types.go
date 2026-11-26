@@ -144,6 +144,17 @@ type TextItem struct {
 type RefMessage struct {
 	MessageItem *MessageItem `json:"message_item,omitempty"`
 	Title       string       `json:"title,omitempty"`
+	SvrID       string       `json:"svr_id,omitempty"`
+	PartialText *PartialText `json:"partial_text,omitempty"`
+}
+
+// PartialText describes the substring a user selected when quoting a message.
+type PartialText struct {
+	Start      string `json:"start,omitempty"`
+	End        string `json:"end,omitempty"`
+	StartIndex int    `json:"startindex,omitempty"`
+	EndIndex   int    `json:"endindex,omitempty"`
+	QuoteMD5   string `json:"quotemd5,omitempty"`
 }
 
 // ToolCallStartItem announces a tool call in progress.
@@ -162,8 +173,9 @@ type ToolCallResultItem struct {
 // MediaInfo holds CDN media reference for uploaded files.
 type MediaInfo struct {
 	EncryptQueryParam string `json:"encrypt_query_param"`
-	AESKey            string `json:"aes_key"`      // base64-encoded
-	EncryptType       int    `json:"encrypt_type"` // 1 = AES-128-ECB
+	AESKey            string `json:"aes_key"`                // base64-encoded
+	FullURL           string `json:"full_url,omitempty"`     // preferred download URL
+	EncryptType       int    `json:"encrypt_type,omitempty"` // 1 = AES-128-ECB
 }
 
 // VoiceItem holds voice content.
@@ -181,6 +193,7 @@ type VoiceItem struct {
 type ImageItem struct {
 	URL     string     `json:"url,omitempty"`
 	Media   *MediaInfo `json:"media,omitempty"`
+	AESKey  string     `json:"aeskey,omitempty"`   // raw AES-128 key as hex; preferred
 	MidSize int        `json:"mid_size,omitempty"` // ciphertext size
 }
 
@@ -217,8 +230,9 @@ type SendMsg struct {
 
 // SendMessageResponse is the response from sendmessage.
 type SendMessageResponse struct {
-	Ret    int    `json:"ret"`
-	ErrMsg string `json:"errmsg,omitempty"`
+	MessageID FlexibleID `json:"message_id,omitempty"`
+	Ret       int        `json:"ret"`
+	ErrMsg    string     `json:"errmsg,omitempty"`
 }
 
 // Typing status constants.

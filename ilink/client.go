@@ -9,7 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,7 +23,53 @@ const (
 	defaultBotAgent = "WeClaw/" + channelVersion
 	longPollTimeout = 35 * time.Second
 	sendTimeout     = 15 * time.Second
+	notifyTimeout   = 5 * time.Second
 )
+
+type channelOptions struct {
+	botAgent string
+	routeTag int64
+}
+
+var currentChannelOptions atomic.Value
+
+func init() {
+	currentChannelOptions.Store(channelOptions{botAgent: defaultBotAgent})
+}
+
+// ConfigureChannel applies the optional bot_agent identity and SKRouteTag used
+// by every iLink request. Invalid bot_agent values fall back to the default.
+func ConfigureChannel(botAgent string, routeTag int64) {
+	opts := channelOptions{botAgent: sanitizeBotAgent(botAgent), routeTag: routeTag}
+	currentChannelOptions.Store(opts)
+	log.Printf("[ilink] channel identity: bot_agent=%q route_tag=%d", opts.botAgent, opts.routeTag)
+}
+
+func sanitizeBotAgent(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultBotAgent
+	}
+	out := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw) && len(out) < 256; i++ {
+		c := raw[i]
+		if c >= 0x20 && c <= 0x7e {
+			out = append(out, c)
+		}
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return defaultBotAgent
+	}
+	return value
+}
+
+func channelConfig() channelOptions {
+	if opts, ok := currentChannelOptions.Load().(channelOptions); ok {
+		return opts
+	}
+	return channelOptions{botAgent: defaultBotAgent}
+}
 
 // Client is an iLink HTTP API client.
 type Client struct {
@@ -146,8 +196,38 @@ func (c *Client) GetUploadURL(ctx context.Context, req *GetUploadURLRequest) (*G
 func BuildBaseInfo() BaseInfo {
 	return BaseInfo{
 		ChannelVersion: channelVersion,
-		BotAgent:       defaultBotAgent,
+		BotAgent:       channelConfig().botAgent,
 	}
+}
+
+// NotifyStart announces that the bot is online. Failures are advisory only.
+func (c *Client) NotifyStart(ctx context.Context) error {
+	return c.notify(ctx, "/ilink/bot/msg/notifystart")
+}
+
+// NotifyStop announces that the bot is going offline. Failures are advisory only.
+func (c *Client) NotifyStop(ctx context.Context) error {
+	return c.notify(ctx, "/ilink/bot/msg/notifystop")
+}
+
+type notifyResponse struct {
+	Ret    int    `json:"ret"`
+	ErrMsg string `json:"errmsg,omitempty"`
+}
+
+func (c *Client) notify(ctx context.Context, path string) error {
+	ctx, cancel := context.WithTimeout(ctx, notifyTimeout)
+	defer cancel()
+	var resp notifyResponse
+	if err := c.doPost(ctx, path, struct {
+		BaseInfo BaseInfo `json:"base_info"`
+	}{BaseInfo: BuildBaseInfo()}, &resp); err != nil {
+		return err
+	}
+	if resp.Ret != 0 {
+		return fmt.Errorf("%s failed: ret=%d errmsg=%s", path, resp.Ret, resp.ErrMsg)
+	}
+	return nil
 }
 
 // BaseURL returns the base URL for CDN operations.
@@ -161,7 +241,7 @@ func (c *Client) doPost(ctx context.Context, path string, body interface{}, resu
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, withRouteTag(c.baseURL+path), bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -189,7 +269,7 @@ func (c *Client) doPost(ctx context.Context, path string, body interface{}, resu
 }
 
 func (c *Client) doGet(ctx context.Context, url string, result interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, withRouteTag(url), nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -220,6 +300,21 @@ func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("AuthorizationType", "ilink_bot_token")
 	req.Header.Set("Authorization", "Bearer "+c.botToken)
 	req.Header.Set("X-WECHAT-UIN", c.wechatUIN)
+	if tag := channelConfig().routeTag; tag != 0 {
+		req.Header.Set("SKRouteTag", strconv.FormatInt(tag, 10))
+	}
+}
+
+func withRouteTag(rawURL string) string {
+	tag := channelConfig().routeTag
+	if tag == 0 {
+		return rawURL
+	}
+	separator := "?"
+	if strings.Contains(rawURL, "?") {
+		separator = "&"
+	}
+	return rawURL + separator + "_cradle_hostname=g" + strconv.FormatInt(tag, 10)
 }
 
 func generateWechatUIN() string {

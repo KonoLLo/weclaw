@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,6 +78,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	ilink.ConfigureChannel(cfg.Channel.BotAgent, cfg.Channel.RouteTag)
+	ilink.ConfigureInbound(cfg.Inbound.DebounceMS, cfg.Inbound.MaxBatch)
+	messaging.ConfigureMediaDownload(cfg.Channel.MediaDownload.TimeoutMS, cfg.Channel.MediaDownload.IdleTimeoutMS)
+	messaging.ConfigureErrorNotices(cfg.Channel.ErrorNotices)
+
 	if config.DetectAndConfigure(cfg) {
 		if err := config.Save(cfg); err != nil {
 			log.Printf("Warning: failed to save auto-detected config: %v", err)
@@ -105,6 +111,35 @@ func runStart(cmd *cobra.Command, args []string) error {
 			return config.Save(cfg)
 		},
 	)
+
+	memoryPath, err := messaging.DefaultMemoryStorePath()
+	if err != nil {
+		log.Printf("Warning: failed to resolve memory store path: %v", err)
+	} else if memoryStore, err := messaging.NewMemoryStore(memoryPath); err != nil {
+		log.Printf("Warning: failed to load memory store: %v", err)
+	} else {
+		handler.SetMemoryStore(memoryStore)
+		log.Printf("Memory store: %s", memoryPath)
+	}
+
+	if img := newImageGen(cfg); img != nil {
+		handler.SetImageGen(img)
+	}
+	if vg := newVideoGen(cfg); vg != nil {
+		handler.SetVideoGen(vg)
+	}
+	if ws := newWebSearch(cfg); ws != nil {
+		handler.SetWebSearch(ws)
+	}
+	if tts := newTTS(); tts != nil {
+		handler.SetTTS(tts)
+	}
+	if ws, err := newWorkspaceManager(cfg); err != nil {
+		log.Printf("[workspace] disabled: %v", err)
+	} else if ws != nil {
+		handler.SetWorkspaceManager(ws)
+		defer ws.Close()
+	}
 
 	// Populate agent metas for /status
 	var metas []messaging.AgentMeta
@@ -144,6 +179,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		cronStore := messaging.NewCronStore(cronStorePath)
 		if err := cronStore.Load(); err != nil {
 			log.Printf("Warning: failed to load cron store: %v", err)
+		}
+		if len(cfg.AllowedUsers) > 0 {
+			handler.SetAllowedUsers(cfg.AllowedUsers)
+			log.Printf("Owner allowlist active: %d user(s)", len(cfg.AllowedUsers))
+		} else {
+			log.Println("Owner allowlist empty - serving any WeChat user")
 		}
 		handler.SetCronStore(cronStore)
 
@@ -210,6 +251,21 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	for _, c := range clients {
+		if err := c.NotifyStart(ctx); err != nil {
+			log.Printf("[%s] notify start failed (advisory): %v", c.BotID(), err)
+		}
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, c := range clients {
+			if err := c.NotifyStop(stopCtx); err != nil {
+				log.Printf("[%s] notify stop failed (advisory): %v", c.BotID(), err)
+			}
+		}
+	}()
+
 	// Start monitors immediately — they will use echo mode until agent is ready
 	log.Printf("Starting message bridge for %d account(s)...", len(accounts))
 
@@ -236,10 +292,11 @@ func runMonitorWithRestart(ctx context.Context, creds *ilink.Credentials, handle
 		log.Printf("[%s] Starting monitor...", creds.ILinkBotID)
 
 		client := ilink.NewClient(creds)
-		monitor, err := ilink.NewMonitor(client, handler.HandleMessage)
+		monitor, err := ilink.NewMonitorWithBatch(client, handler.HandleMessages)
 		if err != nil {
 			log.Printf("[%s] Failed to create monitor: %v", creds.ILinkBotID, err)
 		} else {
+			monitor.SetUrgentHandler(handler.HandleUrgentMessage)
 			err = monitor.Run(ctx)
 		}
 
@@ -263,13 +320,145 @@ func runMonitorWithRestart(ctx context.Context, creds *ilink.Credentials, handle
 	}
 }
 
+// newWebSearch builds the switchable search table. DuckDuckGo needs no key;
+// Tavily is listed but unusable until a key exists, so /se can say why instead
+// of hiding the option.
+func newWebSearch(cfg *config.Config) agent.Searcher {
+	providers := []agent.SearchProvider{
+		{Name: "DuckDuckGo", Searcher: agent.NewDuckDuckGo("", cfg.Search.MaxResults)},
+	}
+	key := cfg.Search.APIKey
+	if key == "" {
+		key = os.Getenv("TAVILY_API_KEY")
+	}
+	tavily := agent.SearchProvider{Name: "Tavily"}
+	if key == "" {
+		tavily.Unavailable = "没配 api_key"
+	} else {
+		tavily.Searcher = agent.NewWebSearch(key, cfg.Search.Endpoint, cfg.Search.MaxResults)
+	}
+	providers = append(providers, tavily)
+	pool := agent.NewSearchPool(providers, cfg.Search.Provider)
+	log.Printf("[search] current engine: %s", pool.Name())
+	return pool
+}
+
+// newImageGen builds the text-to-image generator. The key comes from the
+// image section, else the default http agent's key, else ZHIPU_API_KEY; with
+// none of those the feature stays off rather than failing every draw.
+func newImageGen(cfg *config.Config) *agent.ImageGen {
+	ic := cfg.Image
+	key := ic.APIKey
+	if key == "" {
+		if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" {
+			key = a.APIKey
+		}
+	}
+	if key == "" {
+		key = os.Getenv("ZHIPU_API_KEY")
+	}
+	if key == "" {
+		log.Printf("[image] no api_key; /image disabled")
+		return nil
+	}
+	timeout := time.Duration(ic.TimeoutSeconds) * time.Second
+	g := agent.NewImageGen(ic.Endpoint, key, ic.Model, timeout)
+	g.SetSize(ic.Size)
+	log.Printf("[image] text-to-image ready: model=%s size=%s", g.Model(), g.Size())
+	return g
+}
+
+// newVideoGen builds the text-to-video generator. The key comes from the video
+// section, else the image section, else the default http agent's key, else
+// ZHIPU_API_KEY; with none of those /视频 stays off.
+func newVideoGen(cfg *config.Config) *agent.VideoGen {
+	vc := cfg.Video
+	key := vc.APIKey
+	if key == "" {
+		key = cfg.Image.APIKey
+	}
+	if key == "" {
+		if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" {
+			key = a.APIKey
+		}
+	}
+	if key == "" {
+		key = os.Getenv("ZHIPU_API_KEY")
+	}
+	if key == "" {
+		log.Printf("[video] no api_key; /视频 disabled")
+		return nil
+	}
+	timeout := time.Duration(vc.TimeoutSeconds) * time.Second
+	g := agent.NewVideoGen(vc.Endpoint, key, vc.Model, timeout)
+	g.SetSize(vc.Size)
+	g.SetQuality(vc.Quality)
+	g.SetWithAudio(vc.WithAudio)
+	log.Printf("[video] text-to-video ready: model=%s size=%s quality=%s", g.Model(), g.Size(), g.Quality())
+	return g
+}
+
+func newWorkspaceManager(cfg *config.Config) (*messaging.WorkspaceManager, error) {
+	if cfg.Workspace.Disabled {
+		log.Printf("[workspace] disabled by config")
+		return nil, nil
+	}
+	agentName := strings.TrimSpace(cfg.Workspace.Agent)
+	if agentName != "" {
+		agCfg, ok := cfg.Agents[agentName]
+		if !ok || !workspaceAgentType(agCfg.Type) {
+			log.Printf("[workspace] configured agent %q is missing or not acp/cli; /code disabled", agentName)
+			agentName = ""
+		}
+	} else {
+		if agCfg, ok := cfg.Agents["qwen"]; ok && workspaceAgentType(agCfg.Type) {
+			agentName = "qwen"
+		} else if agCfg, ok := cfg.Agents[cfg.DefaultAgent]; ok && workspaceAgentType(agCfg.Type) {
+			agentName = cfg.DefaultAgent
+		}
+	}
+	if agentName == "" {
+		log.Printf("[workspace] no acp/cli agent available; /code disabled, file and run commands stay available")
+	}
+
+	opts := messaging.WorkspaceOptions{
+		Enabled:         true,
+		Root:            cfg.Workspace.Root,
+		Agent:           agentName,
+		AllowShell:      cfg.Workspace.AllowShell,
+		Timeout:         time.Duration(cfg.Workspace.TimeoutSeconds) * time.Second,
+		MaxOutputBytes:  cfg.Workspace.MaxOutputKB << 10,
+		MaxArchiveBytes: int64(cfg.Workspace.MaxArchiveMB) << 20,
+	}
+	factory := func(ctx context.Context, name, cwd string) (agent.Agent, error) {
+		ag := createAgentByNameWithCwd(ctx, cfg, name, cwd)
+		if ag == nil {
+			return nil, fmt.Errorf("agent %q failed to start", name)
+		}
+		return ag, nil
+	}
+	return messaging.NewWorkspaceManager(opts, factory)
+}
+
+func workspaceAgentType(t string) bool {
+	return t == "acp" || t == "cli"
+}
+
 // createAgentByName creates and starts an agent by its config name.
 // Returns nil if the agent is not configured or fails to start.
 func createAgentByName(ctx context.Context, cfg *config.Config, name string) agent.Agent {
+	return createAgentByNameWithCwd(ctx, cfg, name, "")
+}
+
+func createAgentByNameWithCwd(ctx context.Context, cfg *config.Config, name, cwd string) agent.Agent {
 	agCfg, ok := cfg.Agents[name]
 	if !ok {
 		log.Printf("[agent] %q not found in config", name)
 		return nil
+	}
+	workDir := agCfg.Cwd
+	if cwd != "" {
+		workDir = cwd
 	}
 
 	switch agCfg.Type {
@@ -277,7 +466,7 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 		ag := agent.NewACPAgent(agent.ACPAgentConfig{
 			Command:      agCfg.Command,
 			Args:         agCfg.Args,
-			Cwd:          agCfg.Cwd,
+			Cwd:          workDir,
 			Env:          agCfg.Env,
 			Model:        agCfg.Model,
 			SystemPrompt: agCfg.SystemPrompt,
@@ -293,7 +482,7 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			Name:         name,
 			Command:      agCfg.Command,
 			Args:         agCfg.Args,
-			Cwd:          agCfg.Cwd,
+			Cwd:          workDir,
 			Env:          agCfg.Env,
 			Model:        agCfg.Model,
 			SystemPrompt: agCfg.SystemPrompt,
@@ -312,6 +501,8 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			Model:        agCfg.Model,
 			SystemPrompt: agCfg.SystemPrompt,
 			MaxHistory:   agCfg.MaxHistory,
+			Models:       agCfg.Models,
+			Name:         name,
 			Timeout:      time.Duration(agCfg.TimeoutSeconds) * time.Second,
 		})
 		log.Printf("[agent] created HTTP agent: %s (endpoint=%s, model=%s)", name, agCfg.Endpoint, agCfg.Model)
@@ -463,4 +654,14 @@ func stopAllWeclaw() {
 	}
 	killByName(exe)
 	time.Sleep(500 * time.Millisecond)
+}
+
+func newTTS() *agent.TTS {
+	t := agent.NewTTS("")
+	if !t.Available() {
+		log.Printf("[tts] edge-tts not found; voice disabled")
+		return nil
+	}
+	log.Printf("[tts] edge-tts ready: default=%s", t.Voice())
+	return t
 }

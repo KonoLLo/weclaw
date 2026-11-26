@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -199,7 +200,26 @@ func sendMessageRequest(ctx context.Context, client *ilink.Client, req *ilink.Se
 	if resp.Ret != 0 {
 		return fmt.Errorf("send message failed: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
+	rememberOutboundText(client, req, resp)
 	return nil
+}
+
+func rememberOutboundText(client *ilink.Client, req *ilink.SendMessageRequest, resp *ilink.SendMessageResponse) {
+	if client == nil || req == nil || resp == nil || resp.MessageID == "" {
+		return
+	}
+	var bodies []string
+	for _, item := range req.Msg.ItemList {
+		if item.Type == ilink.ItemTypeText && item.TextItem != nil {
+			if text := strings.TrimSpace(item.TextItem.Text); text != "" {
+				bodies = append(bodies, text)
+			}
+		}
+	}
+	if len(bodies) == 0 {
+		return
+	}
+	rememberQuoteMessage(client.BotID(), req.Msg.ToUserID, "outbound", strings.Join(bodies, "\n\n"), resp.MessageID.String())
 }
 
 func nowMillis() int64 {

@@ -10,15 +10,54 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/ilink"
 )
 
-const cdnBaseURL = "https://novac2c.cdn.weixin.qq.com/c2c"
+const (
+	cdnBaseURL            = "https://novac2c.cdn.weixin.qq.com/c2c"
+	mediaDownloadMaxBytes = 100 << 20
+)
+
+type mediaTimeoutSettings struct {
+	total time.Duration
+	idle  time.Duration
+}
+
+var mediaTimeouts atomic.Value
+
+func init() {
+	mediaTimeouts.Store(mediaTimeoutSettings{total: 120 * time.Second, idle: 30 * time.Second})
+}
+
+// ConfigureMediaDownload sets the total and idle timeouts for inbound media
+// downloads. Non-positive values keep the defaults (120s total, 30s idle).
+func ConfigureMediaDownload(totalMS, idleMS int) {
+	total := 120 * time.Second
+	if totalMS > 0 {
+		total = time.Duration(totalMS) * time.Millisecond
+	}
+	idle := 30 * time.Second
+	if idleMS > 0 {
+		idle = time.Duration(idleMS) * time.Millisecond
+	}
+	mediaTimeouts.Store(mediaTimeoutSettings{total: total, idle: idle})
+	log.Printf("[media] download timeouts: total=%s idle=%s", total, idle)
+}
+
+func currentMediaTimeouts() mediaTimeoutSettings {
+	if v, ok := mediaTimeouts.Load().(mediaTimeoutSettings); ok {
+		return v
+	}
+	return mediaTimeoutSettings{total: 120 * time.Second, idle: 30 * time.Second}
+}
 
 // UploadedFile holds the result of a CDN upload.
 type UploadedFile struct {
@@ -105,26 +144,93 @@ func AESKeyToBase64(hexKey string) string {
 	return base64.StdEncoding.EncodeToString([]byte(hexKey))
 }
 
-// DownloadFileFromCDN downloads and decrypts a file from the WeChat CDN.
+// DownloadFileFromCDN downloads and decrypts a file from the WeChat CDN using
+// the legacy encrypt_query_param URL.
 func DownloadFileFromCDN(ctx context.Context, encryptQueryParam, aesKeyBase64 string) ([]byte, error) {
-	// Decode AES key: base64 -> hex string -> raw bytes
-	aesKeyHexBytes, err := base64.StdEncoding.DecodeString(aesKeyBase64)
+	return DownloadCDNMedia(ctx, "", encryptQueryParam, aesKeyBase64)
+}
+
+// DownloadCDNMedia downloads media from full_url when present, otherwise builds
+// the legacy download URL. An empty AES key means the payload is plaintext.
+func DownloadCDNMedia(ctx context.Context, fullURL, encryptQueryParam, aesKeyBase64 string) ([]byte, error) {
+	url, err := cdnDownloadURL(fullURL, encryptQueryParam)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := downloadCDNBytes(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(aesKeyBase64) == "" {
+		return raw, nil
+	}
+	aesKey, err := parseAESKey(aesKeyBase64)
+	if err != nil {
+		return nil, err
+	}
+	return decryptAESECB(raw, aesKey)
+}
+
+// DownloadMediaInfo resolves all CDN variants used by inbound message items.
+// imageAESKeyHex is the hex key from image_item.aeskey, which takes precedence
+// over media.aes_key; images without any key are downloaded as plaintext.
+func DownloadMediaInfo(ctx context.Context, media *ilink.MediaInfo, imageAESKeyHex string) ([]byte, error) {
+	if media == nil {
+		return nil, fmt.Errorf("missing media info")
+	}
+	if media.FullURL == "" && media.EncryptQueryParam == "" {
+		return nil, fmt.Errorf("missing media URL")
+	}
+	key := strings.TrimSpace(imageAESKeyHex)
+	if key == "" {
+		key = media.AESKey
+	}
+	return DownloadCDNMedia(ctx, media.FullURL, media.EncryptQueryParam, key)
+}
+
+func cdnDownloadURL(fullURL, encryptQueryParam string) (string, error) {
+	if u := strings.TrimSpace(fullURL); u != "" {
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			return "", fmt.Errorf("invalid media full_url")
+		}
+		return u, nil
+	}
+	if encryptQueryParam == "" {
+		return "", fmt.Errorf("missing media URL")
+	}
+	return fmt.Sprintf("%s/download?encrypted_query_param=%s",
+		cdnBaseURL, url.QueryEscape(encryptQueryParam)), nil
+}
+
+var aesKeyHexPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+
+// parseAESKey accepts the two wire encodings: base64(raw 16 bytes) for images,
+// and base64(hex string) for files/voice/video. A bare 32-char hex key is also
+// accepted for image_item.aeskey.
+func parseAESKey(aesKeyBase64 string) ([]byte, error) {
+	raw := strings.TrimSpace(aesKeyBase64)
+	if aesKeyHexPattern.MatchString(raw) {
+		return hex.DecodeString(raw)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
 		return nil, fmt.Errorf("decode AES key base64: %w", err)
 	}
-	aesKey, err := hex.DecodeString(string(aesKeyHexBytes))
-	if err != nil {
-		return nil, fmt.Errorf("decode AES key hex: %w", err)
+	if len(decoded) == aes.BlockSize {
+		return decoded, nil
 	}
+	if len(decoded) == 32 && aesKeyHexPattern.Match(decoded) {
+		return hex.DecodeString(string(decoded))
+	}
+	return nil, fmt.Errorf("AES key must decode to 16 bytes or a 32-char hex string")
+}
 
-	// Download encrypted data from CDN
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		cdnBaseURL, url.QueryEscape(encryptQueryParam))
-
-	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+func downloadCDNBytes(ctx context.Context, rawURL string) ([]byte, error) {
+	timeouts := currentMediaTimeouts()
+	reqCtx, cancel := context.WithTimeout(ctx, timeouts.total)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, downloadURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create download request: %w", err)
 	}
@@ -136,17 +242,45 @@ func DownloadFileFromCDN(ctx context.Context, encryptQueryParam, aesKeyBase64 st
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("CDN download HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	encrypted, err := io.ReadAll(resp.Body)
+	data, err := readAllWithIdleTimeout(resp.Body, timeouts.idle)
 	if err != nil {
 		return nil, fmt.Errorf("read CDN response: %w", err)
 	}
+	return data, nil
+}
 
-	// Decrypt AES-128-ECB
-	return decryptAESECB(encrypted, aesKey)
+// readAllWithIdleTimeout aborts a stalled response body. Closing the body on
+// timeout also releases the read goroutine.
+func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, error) {
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(io.LimitReader(body, mediaDownloadMaxBytes+1))
+		done <- readResult{data: data, err: err}
+	}()
+
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			return nil, res.err
+		}
+		if len(res.data) > mediaDownloadMaxBytes {
+			return nil, fmt.Errorf("media exceeds %d bytes", mediaDownloadMaxBytes)
+		}
+		return res.data, nil
+	case <-timer.C:
+		_ = body.Close()
+		return nil, fmt.Errorf("idle timeout after %s", idle)
+	}
 }
 
 // decryptAESECB decrypts data encrypted with AES-128-ECB and removes PKCS7 padding.
