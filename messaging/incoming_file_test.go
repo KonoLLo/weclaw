@@ -144,6 +144,51 @@ func TestFindRecentIncomingFile(t *testing.T) {
 	}
 }
 
+func TestFindRecentIncomingFileSkipsImagesButKeepsZipFallback(t *testing.T) {
+	h := NewHandler(nil, nil)
+	dir := t.TempDir()
+	h.SetSaveDir(dir)
+
+	goPath := filepath.Join(dir, "152103_main.go")
+	if err := os.WriteFile(goPath, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goPath+".sidecar.md", []byte("---\nfrom_user_id: u\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(goPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(goPath+".sidecar.md", old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	imagePath := filepath.Join(dir, "203000_avatar.png")
+	if err := os.WriteFile(imagePath, []byte("not really a png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(imagePath+".sidecar.md", []byte("---\nfrom_user_id: u\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p, ok := h.findRecentIncomingFile("u")
+	if !ok || p.Name != "main.go" {
+		t.Fatalf("recovered %+v, want main.go; image sidecar must not win", p)
+	}
+
+	zipPath := filepath.Join(dir, "203100_archive.zip")
+	if err := os.WriteFile(zipPath, []byte("PK\x03\x04"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zipPath+".sidecar.md", []byte("---\nfrom_user_id: u\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := h.findRecentIncomingFileWithExt("u", ".zip"); !ok || p.Name != "archive.zip" {
+		t.Fatalf("zip fallback recovered %+v, want archive.zip", p)
+	}
+}
+
 func TestFormatIncomingSize(t *testing.T) {
 	cases := map[int]string{
 		512:             "512B",

@@ -323,6 +323,12 @@ func (h *Handler) findRecentIncomingFileWithExt(userID, ext string) (pendingInco
 		}
 		displayName := displayNameFromStoredFile(name)
 		extraction := extractIncomingContent(displayName, data)
+		// Images and videos also get sidecars for quote recall. They are not
+		// text uploads, so a later "analyze this code" question must not pick
+		// an old screenshot as its attachment.
+		if ext == "" && extraction.Kind == "" && !isTextFile(displayName, data) {
+			continue
+		}
 		readErr := ""
 		if extraction.Err != nil {
 			readErr = officeReadError(extraction.Kind)

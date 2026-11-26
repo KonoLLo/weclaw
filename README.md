@@ -19,11 +19,11 @@
 | --- | --- |
 | 微信排版 | `/help`、Hermes 帮助、技能中心帮助全部中文化；按微信气泡规则逐行排版，不再把整份帮助压成几段 |
 | 联网搜索 | `/s` 联网搜索，默认 DuckDuckGo；`/se` 在 DuckDuckGo / Tavily 之间切换，选择重启后保留；回复只给中文摘要，不带不可点击的 URL |
-| 模型切换 | `/mod` 查看/切换 HTTP 助手的模型，`/mod-t` 实测候选模型当前可用性；选择持久化 |
+| 模型切换 | `/mod` 查看/切换 HTTP 助手的模型，`/mod-t` 实测候选模型当前可用性；选择持久化；`/gm` 可切到 Gemini |
 | 图片生成 | `/图` 或“画一只……”触发，免费 `cogview-3-flash`，支持 7 档尺寸并自动吸附 |
 | 视频生成 | `/视频` 或“生成一段……”触发，免费 `cogvideox-flash`，支持 8 档尺寸，异步生成、可 `/stop` |
 | 语音 | `/语音`、`/音色`，基于 `edge-tts`，8 个中文音色；有 ffmpeg 时发可点开播放的视频气泡，没有则回传 mp3 |
-| 长期记忆 | `/记住`、`/记忆`、`/忘记`，每用户最多 50 条，自动注入对话 |
+| 长期记忆 | `/记住`、`/记忆`、`/忘记`，每用户最多 200 条，自动注入对话 |
 | 自然语言提醒 | “一分钟后提醒我喝水”“每天下午 5 点提醒我写日报”；到点像聊天一样由 Agent 生成提醒，而不是固定模板 |
 | 阅读与文件 | `/读` 或直接发链接可读网页；直接发 txt/Markdown/代码/Word/Excel 文件可分析；**不支持 PDF** |
 | 导出 | `/word`、`/excel`、`/导出 word|excel`，零第三方依赖生成 DOCX/XLSX；**不支持 PDF** |
@@ -200,7 +200,7 @@ docker run --rm -v ~/.weclaw:/root/.weclaw weclaw-fork start -f
 | 命令 | 说明 |
 | --- | --- |
 | `/记住 <内容>` | 保存长期记忆 |
-| `/记忆` | 查看已保存记忆 |
+| `/记忆 [页码]` | 查看已保存记忆（每页 10 条，最新优先） |
 | `/忘记 <编号\|关键词>` | 删除一条记忆 |
 | `/读 <链接>` | 读取网页并总结 |
 | 直接发链接 | 自动识别为网页阅读 |
@@ -227,6 +227,7 @@ docker run --rm -v ~/.weclaw:/root/.weclaw weclaw-fork start -f
 | `/s <关键词>` | 联网搜索，默认 DuckDuckGo |
 | `/se` | 查看搜索源及可用性 |
 | `/se <编号\|名称>` | 切换搜索源 |
+| `/gm` | 切到 Gemini（配置见下文） |
 | `/mod` | 查看 HTTP 助手的候选模型 |
 | `/mod <编号\|名称>` | 切换模型 |
 | `/mod-t` | 实测当前可用模型，约需数十秒 |
@@ -254,6 +255,40 @@ docker run --rm -v ~/.weclaw:/root/.weclaw weclaw-fork start -f
 - `/mod` 只对 HTTP 助手有效。ACP / CLI 助手请在它们自己的配置里换模型。
 - `/mod-t` 会逐个探测候选模型，单个请求可能较慢；免费档可用性会分钟级波动。
 - 模型选择写入 `~/.weclaw/models.json`，不修改 `config.json`。
+
+### Gemini 免费模型
+
+Gemini 支持 OpenAI 兼容的 Chat Completions 接口，可以直接作为 HTTP Agent 接入。以下五个型号在 Google AI Studio 免费层可用：
+
+| 型号 | API 名称 | 说明 |
+| --- | --- | --- |
+| Gemini 4 Hydrogen | `gemini-4-hydrogen` | 最新主力模型，免费层高峰可能 503 |
+| Gemini 3.8 Flash | `gemini-3.8-flash` | 长文档与多步编码，免费层高峰可能 503 |
+| Gemini 3.6 Flash | `gemini-3.6-flash` | 上一代主力 Flash，免费层高峰可能 503 |
+| Gemini 3.5 Flash-Lite | `gemini-3.5-flash-lite` | 默认推荐，额度和稳定性相对好 |
+| Gemini 3.1 Flash-Lite | `gemini-3.1-flash-lite` | 最轻量，延迟低 |
+
+在 `~/.weclaw/config.json` 的 `agents` 下增加：
+
+```json
+"gemini": {
+  "type": "http",
+  "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+  "api_key": "REPLACE_WITH_GEMINI_API_KEY",
+  "model": "gemini-3.5-flash-lite",
+  "models": [
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite"
+  ],
+  "max_history": 20,
+  "timeout_seconds": 300
+}
+```
+
+用法：`/gm` 切到 Gemini，发 `/mod` 查看并选择型号，`/mod 4` 切到稳定的 3.5 Flash-Lite；发 `/glm` 可切回原来的智谱助手。免费层有速率限制，且免费层内容会被 Google 用于改进产品，具体以 AI Studio 当前条款为准。
 
 ### 免费生图与生视频
 
@@ -302,8 +337,8 @@ docker run --rm -v ~/.weclaw:/root/.weclaw weclaw-fork start -f
 
 ### 长期记忆
 
-- `/记住`：每用户最多 50 条，单条最多 300 字
-- `/记忆`：按编号列出
+- `/记住`：每用户最多 200 条，单条最多 300 字
+- `/记忆 [页码]`：按编号列出，每页 10 条、最新优先
 - `/忘记 <编号>` 或 `/忘记 <关键词>`：删除匹配项
 - 每轮对话最多注入 2000 字记忆，避免占满上下文
 - 存储：`~/.weclaw/memory.json`

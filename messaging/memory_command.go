@@ -40,7 +40,7 @@ func (h *Handler) executeMemoryCommand(userID string, cmd memoryCommand) string 
 			case errors.Is(err, ErrMemorySecret):
 				return "这类内容（密码、密钥、证件号等）我不会保存，也不建议发在聊天里。"
 			case errors.Is(err, ErrMemoryFull):
-				return "记忆满了（最多 50 条）。\n\n先用 /忘记 <编号> 删掉一些。"
+				return "记忆满了（最多 " + strconv.Itoa(memoryMaxPerUser) + " 条）。\n\n先用 /忘记 <编号> 删掉一些。"
 			case errors.Is(err, ErrMemoryTooLong):
 				return "这条太长了，压缩到 300 字以内再记。"
 			default:
@@ -52,7 +52,18 @@ func (h *Handler) executeMemoryCommand(userID string, cmd memoryCommand) string 
 		return "已记住第 " + strconv.FormatInt(entry.ID, 10) + " 条。\n\n" + entry.Text
 
 	case memoryCmdList:
-		return formatMemoryList(h.memoryStore.List(userID))
+		page := 1
+		if arg := strings.TrimSpace(cmd.arg); arg != "" {
+			n, err := strconv.Atoi(arg)
+			if err != nil {
+				return "页码要是数字，例如：/记忆 2"
+			}
+			page = n
+		}
+		if page < 1 {
+			return "页码从 1 开始。"
+		}
+		return formatMemoryList(h.memoryStore.List(userID), page)
 
 	case memoryCmdForget:
 		arg := strings.TrimSpace(cmd.arg)

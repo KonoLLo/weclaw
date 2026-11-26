@@ -171,7 +171,7 @@ func TestBuildHelpText(t *testing.T) {
 	if strings.Contains(strings.ReplaceAll(text, "\n\n", ""), "\n") {
 		t.Error("help text must separate every line with a blank line for WeChat")
 	}
-	for _, cmd := range []string{"/ws", "/code", "/files", "/cat", "/write", "/run", "/diff", "/pack", "/send", "/cron", "/记住", "/读", "/图", "/视频", "/s", "/se", "/mod", "/语音", "/音色", "/stop", "/word", "/excel", "/导出"} {
+	for _, cmd := range []string{"/ws", "/code", "/files", "/cat", "/write", "/run", "/diff", "/pack", "/send", "/cron", "/记住", "/读", "/图", "/视频", "/s", "/se", "/gm", "/mod", "/语音", "/音色", "/stop", "/word", "/excel", "/导出"} {
 		if !strings.Contains(text, cmd) {
 			t.Errorf("help text should mention %s", cmd)
 		}

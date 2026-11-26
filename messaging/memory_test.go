@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -133,7 +134,8 @@ func TestParseMemoryCommand(t *testing.T) {
 		{"请记住，我不吃香菜", memoryCmdRemember, "我不吃香菜", true},
 		{"帮我记住 我住在杭州", memoryCmdRemember, "我住在杭州", true},
 		{"/记忆", memoryCmdList, "", true},
-		{"/memory", memoryCmdList, "", true},
+		{"/记忆 2", memoryCmdList, "2", true},
+		{"/memory 3", memoryCmdList, "3", true},
 		{"/mem", memoryCmdList, "", true},
 		{"/忘记 2", memoryCmdForget, "2", true},
 		{"/忘记 咖啡", memoryCmdForget, "咖啡", true},
@@ -202,16 +204,50 @@ func TestFormatMemoryPromptBudgetKeepsNewest(t *testing.T) {
 }
 
 func TestFormatMemoryListAndMatches(t *testing.T) {
-	list := formatMemoryList([]MemoryEntry{{ID: 4, Text: "喜欢喝美式"}})
+	list := formatMemoryList([]MemoryEntry{{ID: 4, Text: "喜欢喝美式"}}, 1)
 	if !strings.Contains(list, "4. 喜欢喝美式") || !strings.Contains(list, "/忘记") {
 		t.Fatalf("unexpected list: %q", list)
 	}
-	if !strings.Contains(formatMemoryList(nil), "/记住") {
+	if !strings.Contains(formatMemoryList(nil, 1), "/记住") {
 		t.Fatal("empty list should explain how to add")
+	}
+	if got := formatMemoryList([]MemoryEntry{{ID: 4, Text: "喜欢喝美式"}}, 0); !strings.Contains(got, "页码从 1 开始") {
+		t.Fatalf("unexpected zero-page reply: %q", got)
 	}
 	matches := formatMemoryMatches([]MemoryEntry{{ID: 2, Text: "喜欢喝美式"}, {ID: 5, Text: "咖啡不加糖"}})
 	if !strings.Contains(matches, "/忘记 2") {
 		t.Fatalf("match hint missing: %q", matches)
+	}
+}
+
+func TestFormatMemoryListPagination(t *testing.T) {
+	var entries []MemoryEntry
+	for i := 1; i <= 23; i++ {
+		entries = append(entries, MemoryEntry{ID: int64(i), Text: fmt.Sprintf("note %d", i)})
+	}
+
+	first := formatMemoryList(entries, 1)
+	if !strings.Contains(first, "共 23 条，第 1/3 页") {
+		t.Fatalf("unexpected first-page header: %q", first)
+	}
+	if !strings.Contains(first, "23. note 23") || !strings.Contains(first, "14. note 14") || strings.Contains(first, "13. note 13") {
+		t.Fatalf("unexpected first-page entries: %q", first)
+	}
+
+	last := formatMemoryList(entries, 3)
+	if !strings.Contains(last, "第 3/3 页") || !strings.Contains(last, "3. note 3") || !strings.Contains(last, "1. note 1") || strings.Contains(last, "4. note 4") {
+		t.Fatalf("unexpected last-page entries: %q", last)
+	}
+	if got := formatMemoryList(entries, 4); !strings.Contains(got, "只有 3 页") {
+		t.Fatalf("unexpected out-of-range reply: %q", got)
+	}
+
+	many := make([]MemoryEntry, memoryMaxPerUser)
+	for i := range many {
+		many[i] = MemoryEntry{ID: int64(i + 1), Text: fmt.Sprintf("note %d", i+1)}
+	}
+	if got := formatMemoryList(many, 1); !strings.Contains(got, "共 200 条，第 1/20 页") {
+		t.Fatalf("unexpected full-memory header: %q", got)
 	}
 }
 
@@ -234,6 +270,12 @@ func TestExecuteMemoryCommands(t *testing.T) {
 	reply = h.executeMemoryCommand("u1", memoryCommand{kind: memoryCmdList})
 	if !strings.Contains(reply, "1. 喜欢喝美式") || !strings.Contains(reply, "2. 咖啡不加糖") {
 		t.Fatalf("unexpected list reply: %q", reply)
+	}
+	if got := h.executeMemoryCommand("u1", memoryCommand{kind: memoryCmdList, arg: "2"}); !strings.Contains(got, "只有 1 页") {
+		t.Fatalf("unexpected page-2 reply: %q", got)
+	}
+	if got := h.executeMemoryCommand("u1", memoryCommand{kind: memoryCmdList, arg: "abc"}); !strings.Contains(got, "页码要是数字") {
+		t.Fatalf("unexpected invalid-page reply: %q", got)
 	}
 
 	reply = h.executeMemoryCommand("u1", memoryCommand{kind: memoryCmdForget, arg: "咖啡"})

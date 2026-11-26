@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	memoryMaxPerUser    = 50
+	memoryMaxPerUser    = 200
 	memoryMaxTextRunes  = 300
 	memoryInjectMaxRune = 2000
+	memoryListPageSize  = 10
 )
 
 var (
@@ -278,8 +279,14 @@ func parseMemoryCommand(text string) (memoryCommand, bool) {
 		}
 		return memoryCommand{kind: memoryCmdRemember, arg: arg}, true
 	}
-	if t == "/记忆" || t == "/memory" || t == "/mem" {
-		return memoryCommand{kind: memoryCmdList}, true
+	for _, prefix := range []string{"/记忆", "/memory", "/mem"} {
+		low := strings.ToLower(t)
+		if low == prefix {
+			return memoryCommand{kind: memoryCmdList}, true
+		}
+		if strings.HasPrefix(low, prefix+" ") {
+			return memoryCommand{kind: memoryCmdList, arg: strings.TrimSpace(t[len(prefix):])}, true
+		}
 	}
 	if arg, ok := cutChineseCommand(t, "/忘记"); ok {
 		return memoryCommand{kind: memoryCmdForget, arg: arg}, true
@@ -312,14 +319,32 @@ func cutChineseCommand(text, prefix string) (string, bool) {
 	return strings.TrimSpace(rest), true
 }
 
-func formatMemoryList(entries []MemoryEntry) string {
+func formatMemoryList(entries []MemoryEntry, page int) string {
 	if len(entries) == 0 {
 		return "还没有记忆。\n\n用 /记住 <内容> 让我记住一件事。"
 	}
+	if page < 1 {
+		return "页码从 1 开始。"
+	}
+	total := len(entries)
+	totalPages := (total + memoryListPageSize - 1) / memoryListPageSize
+	if page > totalPages {
+		return fmt.Sprintf("只有 %d 页（共 %d 条）。", totalPages, total)
+	}
+
+	start := total - page*memoryListPageSize
+	if start < 0 {
+		start = 0
+	}
+	end := total - (page-1)*memoryListPageSize
+
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "你让我记住的事（%d 条）：\n\n", len(entries))
-	for _, e := range entries {
-		fmt.Fprintf(&sb, "%d. %s\n\n", e.ID, e.Text)
+	fmt.Fprintf(&sb, "你让我记住的事（共 %d 条，第 %d/%d 页，按最新优先）：\n\n", total, page, totalPages)
+	for i := end - 1; i >= start; i-- {
+		fmt.Fprintf(&sb, "%d. %s\n\n", entries[i].ID, entries[i].Text)
+	}
+	if totalPages > 1 {
+		fmt.Fprintf(&sb, "翻页：/记忆 <页码>（1-%d）\n\n", totalPages)
 	}
 	sb.WriteString("删除：/忘记 <编号或关键词>")
 	return strings.TrimSpace(sb.String())

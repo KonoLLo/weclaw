@@ -137,9 +137,7 @@ func (a *HTTPAgent) ChatWithAttachments(ctx context.Context, conversationID stri
 	if len(attachments) == 0 {
 		return a.Chat(ctx, conversationID, message)
 	}
-	switch a.currentModel() {
-	case "MiniMax-M3.1-Flash", "MiniMax-M3":
-	default:
+	if !supportsNativeMedia(a.currentModel(), attachments) {
 		return a.Chat(ctx, conversationID, MessageWithAttachmentFallback(message, attachments))
 	}
 
@@ -148,6 +146,31 @@ func (a *HTTPAgent) ChatWithAttachments(ctx context.Context, conversationID stri
 		return "", err
 	}
 	return a.chat(ctx, conversationID, content)
+}
+
+// supportsNativeMedia is deliberately a whitelist: sending an image_url to a
+// text-only model turns a clear fallback into a provider-specific 400. Gemini
+// is image-only here because its OpenAI-compatible endpoint accepts image data
+// URLs but not the video_url shape used by MiniMax.
+func supportsNativeMedia(model string, attachments []Attachment) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	switch name {
+	case "minimax-m3.1-flash", "minimax-m3":
+		return true
+	}
+	if !strings.HasPrefix(name, "gemini-") {
+		return false
+	}
+	for _, attachment := range attachments {
+		mediaType := strings.ToLower(strings.TrimSpace(strings.Split(attachment.MIMEType, ";")[0]))
+		if mediaType == "" {
+			mediaType = strings.ToLower(mime.TypeByExtension(filepath.Ext(attachment.Path)))
+		}
+		if !strings.HasPrefix(mediaType, "image/") {
+			return false
+		}
+	}
+	return true
 }
 
 // ChatClean answers a one-off prompt without the persona system prompt or

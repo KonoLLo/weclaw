@@ -69,6 +69,69 @@ func testHTTPAgentChatWithAttachmentsUsesNativeMediaContent(t *testing.T, model 
 	assertContentPartType(t, content[2], "video_url", "video_url", "data:video/mp4;base64,dmlkZW8=")
 }
 
+func TestSupportsNativeMedia(t *testing.T) {
+	image := []Attachment{{Path: "/tmp/sample.png", MIMEType: "image/png"}}
+	video := []Attachment{{Path: "/tmp/sample.mp4", MIMEType: "video/mp4"}}
+	cases := []struct {
+		name        string
+		model       string
+		attachments []Attachment
+		want        bool
+	}{
+		{"minimax image+video", "MiniMax-M3.1-Flash", append(append([]Attachment{}, image...), video...), true},
+		{"gemini image", "gemini-3.1-flash-lite", image, true},
+		{"gemini image uppercase", "Gemini-4-Hydrogen", image, true},
+		{"gemini video", "gemini-3.1-flash-lite", video, false},
+		{"text-only", "text-only-model", image, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := supportsNativeMedia(tc.model, tc.attachments); got != tc.want {
+				t.Fatalf("supportsNativeMedia(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHTTPAgentChatWithAttachmentsUsesNativeImageForGemini(t *testing.T) {
+	var content any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Messages []struct {
+				Content any `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		content = request.Messages[len(request.Messages)-1].Content
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"done"}}]}`))
+	}))
+	defer server.Close()
+
+	imagePath := filepath.Join(t.TempDir(), "sample.png")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "gemini-3.1-flash-lite"})
+	if _, err := ag.ChatWithAttachments(context.Background(), "conversation", "Describe the image.", []Attachment{{
+		Path: imagePath, MIMEType: "image/png", Name: "sample.png",
+	}}); err != nil {
+		t.Fatalf("ChatWithAttachments returned error: %v", err)
+	}
+
+	parts, ok := content.([]any)
+	if !ok {
+		t.Fatalf("user content type = %T, want array", content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("content part count = %d, want 2", len(parts))
+	}
+	assertContentPartType(t, parts[0], "text", "text", "Describe the image.")
+	assertContentPartType(t, parts[1], "image_url", "image_url", "data:image/png;base64,aW1hZ2U=")
+}
+
 func TestHTTPAgentChatWithAttachmentsFallsBackForTextOnlyModel(t *testing.T) {
 	var content any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
