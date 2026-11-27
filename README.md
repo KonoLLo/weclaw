@@ -1,6 +1,6 @@
 # WeClaw · 定制版
 
-把微信消息接入 AI Agent 的桥接服务。基于 [fastclaw-ai/weclaw](https://github.com/fastclaw-ai/weclaw) 定制，当前版本 **1.3.0**。
+把微信消息接入 AI Agent 的桥接服务。基于 [fastclaw-ai/weclaw](https://github.com/fastclaw-ai/weclaw) 定制，当前版本 **1.3.1**。
 
 **这是个人定制 fork，不是上游官方版本。**
 - 升级只用 `weclaw upgrade`：它已改为从本仓库的最新 Release 下载，不会切回官方版。不要执行上游一键安装脚本，也不要手动下载官方二进制覆盖。
@@ -32,9 +32,9 @@
 ### 用发行版（Linux）
 
 ```bash
-tar -xzf weclaw-1.3.0-linux-amd64.tar.gz
+tar -xzf weclaw-1.3.1-linux-amd64.tar.gz
 sudo install -m 0755 weclaw /usr/local/bin/weclaw
-weclaw version    # 应显示 1.3.0
+weclaw version    # 应显示 1.3.1
 weclaw login      # 微信扫码
 weclaw start -f   # 前台试跑
 ```
@@ -60,7 +60,7 @@ weclaw.exe start -f
 ```bash
 git clone https://github.com/KonoLLo/weclaw.git
 cd weclaw
-go build -trimpath -ldflags "-s -w -X github.com/fastclaw-ai/weclaw/cmd.Version=1.3.0" -o weclaw .
+go build -trimpath -ldflags "-s -w -X github.com/fastclaw-ai/weclaw/cmd.Version=1.3.1" -o weclaw .
 sudo install -m 0755 weclaw /usr/local/bin/weclaw
 ```
 
@@ -401,7 +401,7 @@ weclaw upgrade
 ```bash
 git clone https://github.com/KonoLLo/weclaw.git
 cd weclaw
-go build -trimpath -ldflags "-s -w -X github.com/fastclaw-ai/weclaw/cmd.Version=1.3.0" -o weclaw .
+go build -trimpath -ldflags "-s -w -X github.com/fastclaw-ai/weclaw/cmd.Version=1.3.1" -o weclaw .
 sudo install -m 0755 weclaw /usr/local/bin/weclaw
 ```
 

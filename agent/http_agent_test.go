@@ -267,7 +267,7 @@ func TestHTTPAgentRunsServerShellToolLoop(t *testing.T) {
 		requests = append(requests, req)
 		w.Header().Set("Content-Type", "application/json")
 		if len(requests) == 1 {
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"server_shell","arguments":"{\"command\":\"echo tool-ok\"}"}}]}}]}`))
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"server_shell","arguments":"{\"command\":\"echo tool-ok\"}"},"extra_content":{"google":{"thought_signature":"sig-1"}}}]}}]}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"final"}}]}`))
@@ -296,6 +296,24 @@ func TestHTTPAgentRunsServerShellToolLoop(t *testing.T) {
 	}
 	if out, _ := last.Content.(string); !strings.Contains(out, "tool-ok") {
 		t.Fatalf("tool output = %v, want to contain tool-ok", last.Content)
+	}
+	assistant := requests[1].Messages[len(requests[1].Messages)-2]
+	if len(assistant.ToolCalls) != 1 {
+		t.Fatalf("assistant tool_calls = %d, want 1", len(assistant.ToolCalls))
+	}
+	if sig := string(assistant.ToolCalls[0].ExtraContent); !strings.Contains(sig, "sig-1") {
+		t.Fatalf("extra_content = %q, want the provider signature echoed back", sig)
+	}
+}
+
+func TestFriendlyHTTPErrorUsesProviderMessage(t *testing.T) {
+	body := `[{ "error": { "code": 400, "message": "Function call is missing a thought_signature in functionCall parts." } }]`
+	err := friendlyHTTPError(400, body)
+	if err == nil || !strings.Contains(err.Error(), "thought_signature") {
+		t.Fatalf("error = %v, want the provider message", err)
+	}
+	if strings.Contains(err.Error(), `"code"`) {
+		t.Fatalf("error = %v, want raw JSON stripped", err)
 	}
 }
 

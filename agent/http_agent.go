@@ -27,6 +27,9 @@ type ChatMessage struct {
 }
 
 // ToolCall is the OpenAI-compatible function call shape used by server_shell.
+// ExtraContent carries provider metadata that must be echoed back verbatim:
+// Gemini 3 puts a thought_signature there and rejects the follow-up request
+// (HTTP 400) when the tool call is replayed without it.
 type ToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
@@ -34,6 +37,7 @@ type ToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	ExtraContent json.RawMessage `json:"extra_content,omitempty"`
 }
 
 type chatContentPart struct {
@@ -382,8 +386,45 @@ func friendlyHTTPError(status int, body string) error {
 	case status >= 500:
 		return fmt.Errorf("模型服务出错（HTTP %d），请稍后再试", status)
 	default:
-		return fmt.Errorf("模型请求被拒（HTTP %d）：%s", status, truncateForLog(body, 120))
+		if msg := providerErrorMessage(body); msg != "" {
+			return fmt.Errorf("模型请求被拒（HTTP %d）：%s", status, msg)
+		}
+		return fmt.Errorf("模型请求被拒（HTTP %d），详情见日志", status)
 	}
+}
+
+// providerErrorMessage extracts the human-readable message from an OpenAI-style
+// error body (object or array) so WeChat never shows raw provider JSON.
+func providerErrorMessage(body string) string {
+	type errObj struct {
+		Error json.RawMessage `json:"error"`
+	}
+	var list []errObj
+	if json.Unmarshal([]byte(body), &list) == nil && len(list) > 0 {
+		return errorDetail(list[0].Error)
+	}
+	var one errObj
+	if json.Unmarshal([]byte(body), &one) == nil {
+		return errorDetail(one.Error)
+	}
+	return ""
+}
+
+func errorDetail(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+		return truncateForLog(s, 120)
+	}
+	var obj struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && strings.TrimSpace(obj.Message) != "" {
+		return truncateForLog(obj.Message, 120)
+	}
+	return ""
 }
 
 func truncateForLog(s string, max int) string {
