@@ -139,6 +139,38 @@ func (a *HTTPAgent) Info() AgentInfo {
 // SetCwd is a no-op for HTTP agents (they have no working directory).
 func (a *HTTPAgent) SetCwd(_ string) {}
 
+// Shell exposes the host command channel so the message handler can run a
+// command the owner confirmed in chat.
+func (a *HTTPAgent) Shell() *ServerShell { return a.shell }
+
+// AppendHistory records an out-of-band exchange (an owner-confirmed command and
+// its output) so the model sees it in later turns.
+func (a *HTTPAgent) AppendHistory(conversationID, userMessage, assistantMessage string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.history[conversationID] = append(a.history[conversationID],
+		ChatMessage{Role: "user", Content: userMessage},
+		ChatMessage{Role: "assistant", Content: assistantMessage},
+	)
+	if len(a.history[conversationID]) > a.maxHistory*2 {
+		a.history[conversationID] = a.history[conversationID][len(a.history[conversationID])-a.maxHistory*2:]
+	}
+}
+
+// ReplaceLastReply swaps the newest assistant message, so a reply that ignored
+// a pending confirmation does not stay in history as if it had happened.
+func (a *HTTPAgent) ReplaceLastReply(conversationID, text string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	hist := a.history[conversationID]
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].Role == "assistant" {
+			hist[i].Content = text
+			return
+		}
+	}
+}
+
 // ResetSession clears the conversation history for the given conversationID.
 // HTTP agents have no server-side session ID, so an empty string is returned.
 func (a *HTTPAgent) ResetSession(_ context.Context, conversationID string) (string, error) {
@@ -268,7 +300,7 @@ func (a *HTTPAgent) completeOnce(ctx context.Context, messages []ChatMessage, wi
 // completeWithTools runs the function-calling loop: the model may ask for
 // server_shell, the command runs, and the output is fed back until the model
 // produces a plain answer (or the round cap is hit).
-func (a *HTTPAgent) completeWithTools(ctx context.Context, messages []ChatMessage) (string, error) {
+func (a *HTTPAgent) completeWithTools(ctx context.Context, conversationID string, messages []ChatMessage) (string, error) {
 	if a.shell == nil {
 		return a.complete(ctx, messages)
 	}
@@ -289,14 +321,14 @@ func (a *HTTPAgent) completeWithTools(ctx context.Context, messages []ChatMessag
 		}
 		msgs = append(msgs, ChatMessage{Role: "assistant", Content: res.content, ToolCalls: res.toolCalls})
 		for _, tc := range res.toolCalls {
-			msgs = append(msgs, ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: a.runTool(ctx, tc)})
+			msgs = append(msgs, ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: a.runTool(ctx, conversationID, tc)})
 		}
 		log.Printf("[shell] tool round %d finished (%d call(s))", round+1, len(res.toolCalls))
 	}
 	return "", fmt.Errorf("工具调用轮数超过上限（%d）", maxToolRounds)
 }
 
-func (a *HTTPAgent) runTool(ctx context.Context, tc ToolCall) string {
+func (a *HTTPAgent) runTool(ctx context.Context, conversationID string, tc ToolCall) string {
 	if tc.Function.Name != serverShellToolName {
 		return "未知工具：" + tc.Function.Name
 	}
@@ -307,7 +339,7 @@ func (a *HTTPAgent) runTool(ctx context.Context, tc ToolCall) string {
 		return "命令参数解析失败：" + err.Error()
 	}
 	log.Printf("[shell] exec: %s", truncateForLog(args.Command, 300))
-	out, err := a.shell.Run(ctx, args.Command)
+	out, err := a.shell.RunFor(ctx, conversationID, args.Command)
 	if err != nil {
 		if strings.TrimSpace(out) == "" {
 			return err.Error()
@@ -441,7 +473,7 @@ func (a *HTTPAgent) chat(ctx context.Context, conversationID string, content any
 	messages := a.buildMessages(conversationID, content)
 	a.mu.Unlock()
 
-	reply, err := a.completeWithTools(ctx, messages)
+	reply, err := a.completeWithTools(ctx, conversationID, messages)
 	if err != nil {
 		return "", err
 	}

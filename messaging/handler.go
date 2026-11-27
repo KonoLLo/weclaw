@@ -484,6 +484,12 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	}
 
+	// A staged destructive command waits for the owner's short reply. Consume it
+	// here so the model never gets to re-decide what runs.
+	if h.handleShellConfirmation(ctx, client, msg, trimmed, clientID) {
+		return
+	}
+
 	// Keep bridge-only commands like /cwd in WeClaw, but let Hermes own its
 	// native slash commands when Hermes is the active default agent.
 	if !h.shouldBypassBridgeCommand(trimmed) {
@@ -952,6 +958,10 @@ func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, 
 	}
 	log.Printf("[handler] dispatching to agent (%s) for %s", info, userID)
 
+	// A staged command must never be narrated as if it ran. If this turn staged
+	// one, show the fixed confirmation prompt instead of the model's reply.
+	_, stagedBefore, hadBefore := agent.PeekShellPending(userID)
+
 	start := time.Now()
 	if len(attachments) == 0 {
 		if reply, handled, err := h.handleHermesNativeCommand(taskCtx, ag, userID, message); handled {
@@ -1006,6 +1016,16 @@ func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, 
 	if err != nil {
 		log.Printf("[handler] agent error (%s, elapsed=%s): %v", info, elapsed, err)
 		return "", err
+	}
+
+	// A staged command must never be narrated as if it ran. If this turn staged
+	// one, show the fixed confirmation prompt instead of the model's reply.
+	if command, stagedAt, ok := agent.PeekShellPending(userID); ok && (!hadBefore || stagedAt.After(stagedBefore)) {
+		log.Printf("[shell] model reply replaced: command awaits confirmation for %s", userID)
+		reply = buildShellConfirmationPrompt(command)
+		if replacer, ok := ag.(interface{ ReplaceLastReply(string, string) }); ok {
+			replacer.ReplaceLastReply(userID, reply)
+		}
 	}
 
 	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))

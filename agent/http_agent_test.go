@@ -306,6 +306,51 @@ func TestHTTPAgentRunsServerShellToolLoop(t *testing.T) {
 	}
 }
 
+func TestHTTPAgentToolLoopStagesConfirmationCommand(t *testing.T) {
+	type wireMessage struct {
+		Role    string `json:"role"`
+		Content any    `json:"content"`
+	}
+	type wireRequest struct {
+		Messages []wireMessage `json:"messages"`
+	}
+	var requests []wireRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wireRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		requests = append(requests, req)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_c","type":"function","function":{"name":"server_shell","arguments":"{\"command\":\"rm -rf ./build-cache\"}"}}]}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"请确认"}}]}`))
+	}))
+	defer server.Close()
+
+	defer ClearShellPending("u-confirm")
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "m", Shell: NewServerShell(0, 0)})
+	if _, err := ag.Chat(context.Background(), "u-confirm", "清理一下缓存"); err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	last := requests[1].Messages[len(requests[1].Messages)-1]
+	if last.Role != "tool" {
+		t.Fatalf("last message role = %q, want tool", last.Role)
+	}
+	if out, _ := last.Content.(string); !strings.Contains(out, "用户本人确认") {
+		t.Fatalf("tool output = %v, want a confirmation request", last.Content)
+	}
+	command, ok := TakeShellPending("u-confirm")
+	if !ok || command != "rm -rf ./build-cache" {
+		t.Fatalf("pending = %q ok=%v, want the destructive command staged", command, ok)
+	}
+}
+
 func TestFriendlyHTTPErrorUsesProviderMessage(t *testing.T) {
 	body := `[{ "error": { "code": 400, "message": "Function call is missing a thought_signature in functionCall parts." } }]`
 	err := friendlyHTTPError(400, body)
