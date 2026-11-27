@@ -23,6 +23,7 @@ func TestSearchKeyAliases(t *testing.T) {
 		"ddg": "duckduckgo", "DuckDuckGo": "duckduckgo",
 		"tavily": "tavily",
 		"br":     "brave", "Brave": "brave",
+		"searx": "searxng", "SearXNG": "searxng",
 	}
 	for in, want := range cases {
 		if got := searchKey(in); got != want {
@@ -64,6 +65,69 @@ func TestSearchPoolSwitchAndPersist(t *testing.T) {
 	p2 := newSearchPoolAt(providers, "duckduckgo", state)
 	if p2.Name() != "Tavily" {
 		t.Fatalf("reloaded current = %q, want Tavily", p2.Name())
+	}
+}
+
+type fakeTimeSearcher struct {
+	fakeSearcher
+	tr string // empty means the provider itself defaults to none
+}
+
+func (f *fakeTimeSearcher) SetTimeRange(v string) error {
+	tr, err := NormalizeSearchTimeRange(v)
+	if err != nil {
+		return err
+	}
+	f.tr = tr
+	return nil
+}
+
+func (f *fakeTimeSearcher) TimeRange() string { return f.tr }
+
+func TestSearchPoolTimeRangePersists(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "search.json")
+	newProviders := func() []SearchProvider {
+		return []SearchProvider{
+			{Name: "DuckDuckGo", Searcher: &fakeSearcher{name: "DuckDuckGo"}},
+			{Name: "SearXNG", Searcher: &fakeTimeSearcher{fakeSearcher: fakeSearcher{name: "SearXNG"}, tr: "week"}},
+		}
+	}
+
+	p := newSearchPoolAt(newProviders(), "searxng", state)
+	if p.TimeRange() != "week" {
+		t.Fatalf("default = %q, want week", p.TimeRange())
+	}
+	if err := p.SetTimeRange("day"); err != nil {
+		t.Fatalf("set day: %v", err)
+	}
+
+	// Switching providers must not forget the time range.
+	if err := p.SetSearchEngine("duckduckgo"); err != nil {
+		t.Fatal(err)
+	}
+	p2 := newSearchPoolAt(newProviders(), "", state)
+	if p2.Name() != "DuckDuckGo" || p2.TimeRange() != "day" {
+		t.Fatalf("reloaded = (%q, %q), want (DuckDuckGo, day)", p2.Name(), p2.TimeRange())
+	}
+
+	// "off" must survive as off, not fall back to the provider default.
+	if err := p2.SetTimeRange("off"); err != nil {
+		t.Fatal(err)
+	}
+	p3 := newSearchPoolAt(newProviders(), "", state)
+	if p3.TimeRange() != "" {
+		t.Fatalf("reloaded off = %q, want empty", p3.TimeRange())
+	}
+}
+
+func TestSearchPoolTimeRangeUnsupported(t *testing.T) {
+	providers := []SearchProvider{{Name: "DuckDuckGo", Searcher: &fakeSearcher{name: "DuckDuckGo"}}}
+	p := newSearchPoolAt(providers, "", filepath.Join(t.TempDir(), "search.json"))
+	if err := p.SetTimeRange("day"); err == nil {
+		t.Fatal("want unsupported error when no provider takes a time range")
+	}
+	if p.TimeRange() != "" {
+		t.Fatalf("state changed on failure: %q", p.TimeRange())
 	}
 }
 

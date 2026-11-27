@@ -22,6 +22,15 @@ type Config struct {
 	Inbound      InboundConfig          `json:"inbound,omitempty"`
 	Channel      ChannelConfig          `json:"channel,omitempty"`
 	Workspace    WorkspaceConfig        `json:"workspace,omitempty"`
+	ServerShell  ServerShellConfig      `json:"server_shell,omitempty"`
+}
+
+// ServerShellConfig enables the server_shell tool: the HTTP agent may run
+// shell commands on the host through function calling. Off unless enabled.
+type ServerShellConfig struct {
+	Enabled        bool `json:"enabled,omitempty"`
+	TimeoutSeconds int  `json:"timeout_seconds,omitempty"` // 0 = 30s
+	MaxOutputKB    int  `json:"max_output_kb,omitempty"`   // 0 = 32
 }
 
 // InboundConfig controls per-sender debounce and batch limits.
@@ -62,6 +71,8 @@ type SearchConfig struct {
 	Provider    string `json:"provider,omitempty"` // "duckduckgo" (default) or "tavily"
 	APIKey      string `json:"api_key,omitempty"`  // Tavily only
 	BraveKey    string `json:"brave_api_key,omitempty"`
+	SearXNGURL  string `json:"searxng_url,omitempty"`
+	SearXNGAuth string `json:"searxng_auth,omitempty"` // optional Authorization header value
 	DisableAuto bool   `json:"disable_auto,omitempty"` // true = never search before a normal reply
 	Endpoint    string `json:"endpoint,omitempty"`
 	MaxResults  int    `json:"max_results,omitempty"`

@@ -103,14 +103,23 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Available agents: %v (default: %s)", names, cfg.DefaultAgent)
 	}
 
+	// Serialize runtime config writes: /mod and /se can save from separate
+	// message goroutines and must not interleave truncated writes.
+	var cfgSaveMu sync.Mutex
+	saveCfg := func(mutate func()) error {
+		cfgSaveMu.Lock()
+		defer cfgSaveMu.Unlock()
+		mutate()
+		return config.Save(cfg)
+	}
+
 	// Create handler with an agent factory for on-demand agent creation
 	handler := messaging.NewHandler(
 		func(ctx context.Context, name string) agent.Agent {
 			return createAgentByName(ctx, cfg, name)
 		},
 		func(name string) error {
-			cfg.DefaultAgent = name
-			return config.Save(cfg)
+			return saveCfg(func() { cfg.DefaultAgent = name })
 		},
 	)
 
@@ -134,6 +143,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		handler.SetWebSearch(ws)
 	}
 	handler.SetAutoSearch(!cfg.Search.DisableAuto)
+	handler.SetAutoSearchSaver(func(on bool) error {
+		return saveCfg(func() { cfg.Search.DisableAuto = !on })
+	})
 	if tts := newTTS(); tts != nil {
 		handler.SetTTS(tts)
 	}
@@ -324,11 +336,12 @@ func runMonitorWithRestart(ctx context.Context, creds *ilink.Credentials, handle
 }
 
 // newWebSearch builds the switchable search table. DuckDuckGo needs no key;
-// Tavily is listed but unusable until a key exists, so /se can say why instead
-// of hiding the option.
+// every other provider is listed but unusable until a key exists, so /se can
+// say why instead of hiding the option.
 func newWebSearch(cfg *config.Config) agent.Searcher {
+	ddg := agent.NewDuckDuckGo("", cfg.Search.MaxResults)
 	providers := []agent.SearchProvider{
-		{Name: "DuckDuckGo", Searcher: agent.NewDuckDuckGo("", cfg.Search.MaxResults)},
+		{Name: "DuckDuckGo", Searcher: ddg},
 	}
 	key := cfg.Search.APIKey
 	if key == "" {
@@ -352,6 +365,28 @@ func newWebSearch(cfg *config.Config) agent.Searcher {
 		brave.Searcher = agent.NewBraveSearch(braveKey, "", cfg.Search.MaxResults)
 	}
 	providers = append(providers, brave)
+	searxURL := strings.TrimSpace(cfg.Search.SearXNGURL)
+	if searxURL == "" {
+		searxURL = os.Getenv("SEARXNG_URL")
+	}
+	searxAuth := strings.TrimSpace(cfg.Search.SearXNGAuth)
+	if searxAuth == "" {
+		searxAuth = os.Getenv("SEARXNG_AUTH")
+	}
+	searx := agent.SearchProvider{Name: "SearXNG"}
+	if searxURL == "" {
+		searx.Unavailable = "没配 searxng_url"
+		providers = append(providers, searx)
+	} else {
+		sx := agent.NewSearXNG(searxURL, searxAuth, cfg.Search.MaxResults)
+		searx.Searcher = sx
+		providers = append(providers, searx)
+		// Merged source only makes sense when both halves exist.
+		providers = append(providers, agent.SearchProvider{
+			Name:     "合并",
+			Searcher: agent.NewMergeSearch(sx, ddg, cfg.Search.MaxResults),
+		})
+	}
 	pool := agent.NewSearchPool(providers, cfg.Search.Provider)
 	log.Printf("[search] current engine: %s", pool.Name())
 	return pool
@@ -551,6 +586,17 @@ func createAgentByNameWithCwd(ctx context.Context, cfg *config.Config, name, cwd
 			log.Printf("[agent] HTTP agent %q has no endpoint", name)
 			return nil
 		}
+		var shell *agent.ServerShell
+		if cfg.ServerShell.Enabled {
+			if len(cfg.AllowedUsers) == 0 {
+				// An empty allow-list serves every WeChat user; handing them a host
+				// shell is one forwarded message away from a remote takeover.
+				log.Printf("[agent] server shell NOT enabled: allowed_users is empty — fill in your own WeChat ID first")
+			} else {
+				shell = agent.NewServerShell(cfg.ServerShell.TimeoutSeconds, cfg.ServerShell.MaxOutputKB)
+				log.Printf("[agent] server shell enabled for %q (timeout=%s, max_output=%dKB)", name, shell.Timeout, shell.MaxOutputBytes>>10)
+			}
+		}
 		ag := agent.NewHTTPAgent(agent.HTTPAgentConfig{
 			Endpoint:     agCfg.Endpoint,
 			APIKey:       agCfg.APIKey,
@@ -561,6 +607,7 @@ func createAgentByNameWithCwd(ctx context.Context, cfg *config.Config, name, cwd
 			Models:       agCfg.Models,
 			Name:         name,
 			Timeout:      time.Duration(agCfg.TimeoutSeconds) * time.Second,
+			Shell:        shell,
 		})
 		log.Printf("[agent] created HTTP agent: %s (endpoint=%s, model=%s)", name, agCfg.Endpoint, agCfg.Model)
 		return ag

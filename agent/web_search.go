@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -22,6 +24,12 @@ type SearchResult struct {
 	URL        string `json:"url"`
 	Content    string `json:"content"`
 	RawContent string `json:"raw_content,omitempty"`
+}
+
+var searchTagPattern = regexp.MustCompile(`<[^>]+>`)
+
+func searchPlainText(s string) string {
+	return strings.TrimSpace(html.UnescapeString(searchTagPattern.ReplaceAllString(s, "")))
 }
 
 // Searcher is the common surface for /s providers.

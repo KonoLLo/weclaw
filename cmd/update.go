@@ -8,13 +8,16 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 )
 
-const githubRepo = "fastclaw-ai/weclaw"
+// githubRepo is this fork, not upstream: "weclaw upgrade" must never pull an
+// official binary over the customized build.
+const githubRepo = "KonoLLo/weclaw"
 
 func init() {
 	rootCmd.AddCommand(updateCmd)
@@ -50,17 +53,29 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to check latest version: %w", err)
 	}
 
-	if latest == Version {
+	if cmp, ok := compareVersions(Version, latest); ok {
+		if cmp == 0 {
+			fmt.Printf("Already up to date (%s)\n", Version)
+			return nil
+		}
+		if cmp > 0 {
+			fmt.Printf("Local build %s is newer than latest release %s, nothing to do\n", Version, latest)
+			return nil
+		}
+	} else if latest == Version {
 		fmt.Printf("Already up to date (%s)\n", Version)
 		return nil
 	}
 
-	fmt.Printf("Current: %s -> Latest: %s\n", Version, latest)
+	fmt.Printf("Current: %s -> Latest: %s (github.com/%s)\n", Version, latest, githubRepo)
 
 	// 2. Download new binary
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	filename := fmt.Sprintf("weclaw_%s_%s", goos, goarch)
+	if goos == "windows" {
+		filename += ".exe"
+	}
 	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, latest, filename)
 
 	fmt.Printf("Downloading %s...\n", url)
@@ -114,10 +129,67 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			fmt.Println("Update complete. Please run 'weclaw start' manually.")
 		}
 	} else {
-		fmt.Println("Update complete. Run 'weclaw start' to start.")
+		if runtime.GOOS == "linux" && restartSystemdService() {
+			fmt.Println("Restarted weclaw.service")
+		} else {
+			fmt.Println("Update complete. Run 'weclaw start' to start.")
+		}
 	}
 
 	return nil
+}
+
+// compareVersions compares dotted numeric versions with an optional leading
+// "v". It reports false when either side is not numeric, so callers can fall
+// back to plain string comparison.
+func compareVersions(a, b string) (int, bool) {
+	parse := func(s string) ([3]int, bool) {
+		s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+		var out [3]int
+		parts := strings.Split(s, ".")
+		if len(parts) == 0 || len(parts) > 3 {
+			return out, false
+		}
+		for i, p := range parts {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 0 {
+				return out, false
+			}
+			out[i] = n
+		}
+		return out, true
+	}
+	av, ok := parse(a)
+	if !ok {
+		return 0, false
+	}
+	bv, ok := parse(b)
+	if !ok {
+		return 0, false
+	}
+	for i := 0; i < 3; i++ {
+		if av[i] != bv[i] {
+			if av[i] < bv[i] {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+// restartSystemdService restarts the weclaw unit when this binary was started
+// by systemd. Failure is non-fatal: the new binary is already in place.
+func restartSystemdService() bool {
+	out, err := exec.Command("systemctl", "is-active", "weclaw").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "active" {
+		return false
+	}
+	fmt.Println("Restarting weclaw service...")
+	cmd := exec.Command("systemctl", "restart", "weclaw")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run() == nil
 }
 
 func getLatestVersion() (string, error) {

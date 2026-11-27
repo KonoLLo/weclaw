@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHTTPAgentChatWithAttachmentsUsesNativeMediaContent(t *testing.T) {
@@ -164,6 +165,171 @@ func TestHTTPAgentChatWithAttachmentsFallsBackForTextOnlyModel(t *testing.T) {
 	}
 	if !strings.Contains(text, "/tmp/sample.png") {
 		t.Fatalf("fallback content does not contain attachment path: %q", text)
+	}
+}
+
+func TestHTTPAgentRetriesServiceUnavailableOnce(t *testing.T) {
+	oldDelay := httpRetryDelay
+	httpRetryDelay = 10 * time.Millisecond
+	defer func() { httpRetryDelay = oldDelay }()
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":503,"status":"UNAVAILABLE"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "gemini-3.1-flash-lite"})
+	reply, err := ag.Chat(context.Background(), "u-retry", "hi")
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if reply != "ok" {
+		t.Fatalf("reply = %q, want ok", reply)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (one retry)", calls)
+	}
+}
+
+func TestHTTPAgentFriendlyErrorAfterRetry(t *testing.T) {
+	oldDelay := httpRetryDelay
+	httpRetryDelay = 10 * time.Millisecond
+	defer func() { httpRetryDelay = oldDelay }()
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":503,"message":"This model is currently experiencing high demand"}}`))
+	}))
+	defer server.Close()
+
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "gemini-3.1-flash-lite"})
+	_, err := ag.Chat(context.Background(), "u-503", "hi")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), `"error"`) || strings.Contains(err.Error(), "UNAVAILABLE") {
+		t.Fatalf("raw provider body leaked to user: %v", err)
+	}
+	if !strings.Contains(err.Error(), "太忙") {
+		t.Fatalf("error should be friendly Chinese: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
+func TestHTTPAgentDoesNotRetryAuthErrors(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+	}))
+	defer server.Close()
+
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "m"})
+	_, err := ag.Chat(context.Background(), "u-401", "hi")
+	if err == nil || !strings.Contains(err.Error(), "API Key") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (no retry on 401)", calls)
+	}
+}
+
+func TestHTTPAgentRunsServerShellToolLoop(t *testing.T) {
+	type wireMessage struct {
+		Role       string     `json:"role"`
+		Content    any        `json:"content"`
+		ToolCalls  []ToolCall `json:"tool_calls"`
+		ToolCallID string     `json:"tool_call_id"`
+	}
+	type wireRequest struct {
+		Tools    []map[string]any `json:"tools"`
+		Messages []wireMessage    `json:"messages"`
+	}
+	var requests []wireRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wireRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		requests = append(requests, req)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"server_shell","arguments":"{\"command\":\"echo tool-ok\"}"}}]}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"final"}}]}`))
+	}))
+	defer server.Close()
+
+	sh := NewServerShell(0, 0)
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "m", Shell: sh})
+	if _, err := ag.Chat(context.Background(), "u-tool", "run something"); err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if len(requests[0].Tools) != 1 {
+		t.Fatalf("first request tools = %d, want 1", len(requests[0].Tools))
+	}
+	fn, _ := requests[0].Tools[0]["function"].(map[string]any)
+	if fn["name"] != serverShellToolName {
+		t.Fatalf("tool name = %v, want %s", fn["name"], serverShellToolName)
+	}
+	last := requests[1].Messages[len(requests[1].Messages)-1]
+	if last.Role != "tool" || last.ToolCallID != "call_1" {
+		t.Fatalf("last message role=%q tool_call_id=%q, want tool/call_1", last.Role, last.ToolCallID)
+	}
+	if out, _ := last.Content.(string); !strings.Contains(out, "tool-ok") {
+		t.Fatalf("tool output = %v, want to contain tool-ok", last.Content)
+	}
+}
+
+func TestHTTPAgentFallsBackWhenProviderRejectsTools(t *testing.T) {
+	var withTools, withoutTools int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Tools []map[string]any `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if len(req.Tools) > 0 {
+			withTools++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"tools is not supported"}}`))
+			return
+		}
+		withoutTools++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain"}}]}`))
+	}))
+	defer server.Close()
+
+	ag := NewHTTPAgent(HTTPAgentConfig{Endpoint: server.URL, Model: "m", Shell: NewServerShell(0, 0)})
+	reply, err := ag.Chat(context.Background(), "u-notools", "hi")
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if reply != "plain" {
+		t.Fatalf("reply = %q, want plain", reply)
+	}
+	if withTools != 1 || withoutTools != 1 {
+		t.Fatalf("calls with/without tools = %d/%d, want 1/1", withTools, withoutTools)
 	}
 }
 

@@ -13,21 +13,22 @@ import (
 )
 
 const (
-	autoSearchTimeout    = 30 * time.Second
-	autoSearchMinRunes   = 4
-	autoSearchMaxQuery   = 80
-	autoSearchMaxQueries = agent.DeepSearchMaxQueries
-	autoSearchFetchPages = agent.DeepSearchDefaultPages
-	autoSearchMaxDigest  = 700
-	autoSearchMaxSnippet = 200
-	autoSearchMaxPage    = 1100
+	autoSearchTimeout       = 30 * time.Second
+	autoSearchRouterTimeout = 10 * time.Second
+	autoSearchMinRunes      = 4
+	autoSearchMaxQuery      = 80
+	autoSearchMaxQueries    = agent.DeepSearchMaxQueries
+	autoSearchFetchPages    = agent.DeepSearchDefaultPages
+	autoSearchMaxDigest     = 700
+	autoSearchMaxSnippet    = 200
+	autoSearchMaxPage       = 1100
 )
 
 // autoSearchPrompt decides whether this normal chat turn needs fresh facts,
 // searches when it does, and returns a distilled context block to prepend.
 // "" means the turn goes out without web material.
 func (h *Handler) autoSearchPrompt(ctx context.Context, userID, text string, ag agent.Agent) string {
-	if !h.autoSearch || h.webSearch == nil {
+	if !h.autoSearchEnabled() || h.webSearch == nil {
 		return ""
 	}
 	cc, ok := ag.(agent.CleanChatter)
@@ -41,9 +42,18 @@ func (h *Handler) autoSearchPrompt(ctx context.Context, userID, text string, ag 
 	sctx, cancel := context.WithTimeout(ctx, autoSearchTimeout)
 	defer cancel()
 
-	queries, need := autoSearchQueries(sctx, cc, question)
-	if !need {
+	rctx, rcancel := context.WithTimeout(sctx, autoSearchRouterTimeout)
+	queries, need, judged := autoSearchQueries(rctx, cc, question)
+	rcancel()
+	if judged && !need {
 		return ""
+	}
+	if !judged {
+		// The router itself failed (timeout, 503, unparsable answer). Skipping
+		// the search here makes the model answer from memory and invent
+		// details, so fall back to searching with the raw question.
+		queries = []string{truncateRunes(question, autoSearchMaxQuery)}
+		log.Printf("[search] auto router unavailable, fallback query %q", queries[0])
 	}
 	bundle, err := agent.DeepSearch(sctx, h.webSearch, queries, autoSearchFetchPages)
 	if err != nil {
@@ -64,8 +74,10 @@ func (h *Handler) autoSearchPrompt(ctx context.Context, userID, text string, ag 
 }
 
 // autoSearchQueries is the cheap router: it asks the model whether external
-// facts are needed and, if so, for up to three complementary queries.
-func autoSearchQueries(ctx context.Context, cc agent.CleanChatter, question string) ([]string, bool) {
+// facts are needed and, if so, for up to three complementary queries. The
+// third return value is false when the router could not produce a decision,
+// which the caller treats differently from a confident "no search".
+func autoSearchQueries(ctx context.Context, cc agent.CleanChatter, question string) ([]string, bool, bool) {
 	prompt := `你是联网搜索调度器。判断用户这句话要不要联网查实时或外部事实（新闻、价格、天气、赛事、人物近况、产品参数、教程、政策、事实核查等）才能答好。
 只输出一行 JSON，不要解释：{"search":true,"queries":["检索词1","检索词2"]} 或 {"search":false}
 规则：寒暄、情绪、闲聊、角色扮演、创作、数学计算、关于用户自己的信息、对聊天上下文的追问 → false。
@@ -76,15 +88,15 @@ func autoSearchQueries(ctx context.Context, cc agent.CleanChatter, question stri
 	out, err := cc.ChatClean(ctx, prompt)
 	if err != nil {
 		log.Printf("[search] auto router failed: %v", err)
-		return nil, false
+		return nil, false, false
 	}
 	return parseAutoSearchDecision(out)
 }
 
-func parseAutoSearchDecision(raw string) ([]string, bool) {
+func parseAutoSearchDecision(raw string) ([]string, bool, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return nil, false
+		return nil, false, false
 	}
 	if start, end := strings.Index(s, "{"), strings.LastIndex(s, "}"); start >= 0 && end > start {
 		s = s[start : end+1]
@@ -95,10 +107,10 @@ func parseAutoSearchDecision(raw string) ([]string, bool) {
 		Queries []string `json:"queries"`
 	}
 	if err := json.Unmarshal([]byte(s), &d); err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	if !d.Search {
-		return nil, false
+		return nil, false, true
 	}
 	candidates := append([]string{d.Query}, d.Queries...)
 	seen := make(map[string]bool)
@@ -118,9 +130,9 @@ func parseAutoSearchDecision(raw string) ([]string, bool) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, false
+		return nil, false, false
 	}
-	return out, true
+	return out, true, true
 }
 
 // autoSearchDigest condenses search snippets plus fetched page text into a

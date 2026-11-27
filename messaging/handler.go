@@ -32,28 +32,30 @@ type AgentMeta struct {
 
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
-	mu            sync.RWMutex
-	defaultName   string
-	agents        map[string]agent.Agent // name -> running agent
-	agentMetas    []AgentMeta            // all configured agents (for /status)
-	agentWorkDirs map[string]string      // agent name -> configured/runtime cwd
-	customAliases map[string]string      // custom alias -> agent name (from config)
-	factory       AgentFactory
-	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map          // map[userID]contextToken
-	saveDir       string            // directory to save images/files to
-	seenMsgs      sync.Map          // map[int64]time.Time — dedup by message_id
-	pendingFiles  sync.Map          // map[userID]pendingIncomingFile — last upload waiting for a question
-	cronStore     *CronStore        // cron job store (nil if not configured)
-	memoryStore   *MemoryStore      // long-term per-user notes (nil = disabled)
-	memoryLearn   *memoryLearner    // background chat-memory extractor (nil = disabled)
-	allowedUsers  []string          // when non-empty, only these WeChat user IDs are served
-	imageGen      *agent.ImageGen   // text-to-image generator (nil = /图 disabled)
-	videoGen      *agent.VideoGen   // text-to-video generator (nil = /视频 disabled)
-	webSearch     agent.Searcher    // DuckDuckGo or Tavily (nil = disabled)
-	autoSearch    bool              // search the web before normal replies
-	tts           *agent.TTS        // edge-tts client (nil = voice disabled)
-	workspace     *WorkspaceManager // per-user code workspace (nil = disabled)
+	mu             sync.RWMutex
+	defaultName    string
+	agents         map[string]agent.Agent // name -> running agent
+	agentMetas     []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs  map[string]string      // agent name -> configured/runtime cwd
+	customAliases  map[string]string      // custom alias -> agent name (from config)
+	factory        AgentFactory
+	saveDefault    SaveDefaultFunc
+	contextTokens  sync.Map        // map[userID]contextToken
+	saveDir        string          // directory to save images/files to
+	seenMsgs       sync.Map        // map[int64]time.Time — dedup by message_id
+	pendingFiles   sync.Map        // map[userID]pendingIncomingFile — last upload waiting for a question
+	cronStore      *CronStore      // cron job store (nil if not configured)
+	memoryStore    *MemoryStore    // long-term per-user notes (nil = disabled)
+	memoryLearn    *memoryLearner  // background chat-memory extractor (nil = disabled)
+	allowedUsers   []string        // when non-empty, only these WeChat user IDs are served
+	imageGen       *agent.ImageGen // text-to-image generator (nil = /图 disabled)
+	videoGen       *agent.VideoGen // text-to-video generator (nil = /视频 disabled)
+	webSearch      agent.Searcher  // search pool (nil = disabled)
+	autoSearchMu   sync.RWMutex
+	autoSearch     bool              // search the web before normal replies
+	saveAutoSearch func(bool) error  // persist /se on|off to config (nil = runtime only)
+	tts            *agent.TTS        // edge-tts client (nil = voice disabled)
+	workspace      *WorkspaceManager // per-user code workspace (nil = disabled)
 
 	tasksMu sync.Mutex
 	tasks   map[string]map[uint64]runningTask
@@ -133,7 +135,20 @@ func (h *Handler) SetVideoGen(g *agent.VideoGen) { h.videoGen = g }
 func (h *Handler) SetWebSearch(w agent.Searcher) { h.webSearch = w }
 
 // SetAutoSearch toggles the search-before-reply behaviour.
-func (h *Handler) SetAutoSearch(on bool) { h.autoSearch = on }
+func (h *Handler) SetAutoSearch(on bool) {
+	h.autoSearchMu.Lock()
+	defer h.autoSearchMu.Unlock()
+	h.autoSearch = on
+}
+
+// SetAutoSearchSaver persists /se on|off so the choice survives restarts.
+func (h *Handler) SetAutoSearchSaver(fn func(bool) error) { h.saveAutoSearch = fn }
+
+func (h *Handler) autoSearchEnabled() bool {
+	h.autoSearchMu.RLock()
+	defer h.autoSearchMu.RUnlock()
+	return h.autoSearch
+}
 
 // SetTTS enables /语音 and the voice keywords (nil = disabled).
 func (h *Handler) SetTTS(t *agent.TTS) { h.tts = t }
@@ -1238,7 +1253,7 @@ func wechatLines(text string) string {
 }
 
 func buildHelpText() string {
-	return wechatLines(`WeClaw 命令帮助
+	return wechatLines(`WeClaw · 定制版 命令帮助
 
 【基本】
 @agent 或 /agent - 切换默认 AI 助手
@@ -1285,7 +1300,9 @@ func buildHelpText() string {
 【搜索与模型】
 /s <关键词> 或 搜一下… - 联网搜索（默认 DuckDuckGo）
 普通聊天也会自动判断要不要联网，需要就先搜再答
-/se [list|N|name] - 查看或切换搜索引擎（DuckDuckGo / Tavily / Brave）
+/se [list|N|name] - 查看或切换搜索引擎（DuckDuckGo / Tavily / Brave / SearXNG / 合并）
+/se on|off - 开启/关闭智能搜索（回复前自动联网）
+/se time day|week|month|year|off - 限制搜索结果时间（仅 SearXNG）
 /gm - 切到 Gemini，再发 /mod 选免费型号
 /mod [list|N|name] - 查看或切换模型（仅 HTTP 助手）
 /mod-t - 测试当前可用模型

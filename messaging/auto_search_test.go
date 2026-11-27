@@ -12,11 +12,17 @@ import (
 type fakeCleanAgent struct {
 	fakeAgent
 	replies []string
+	errs    []error
 	prompts []string
 }
 
 func (f *fakeCleanAgent) ChatClean(_ context.Context, message string) (string, error) {
 	f.prompts = append(f.prompts, message)
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return "", err
+	}
 	if len(f.replies) == 0 {
 		return "", errors.New("no scripted reply")
 	}
@@ -45,22 +51,23 @@ func TestParseAutoSearchDecision(t *testing.T) {
 		raw     string
 		queries []string
 		need    bool
+		ok      bool
 	}{
-		{"plain json", `{"search":true,"query":"上海 天气"}`, []string{"上海 天气"}, true},
-		{"code fence", "```json\n{\"search\":true,\"query\":\"GPT-5 发布\"}\n```", []string{"GPT-5 发布"}, true},
-		{"multi queries", `{"search":true,"queries":["上海 天气","上海 降雨"]}`, []string{"上海 天气", "上海 降雨"}, true},
-		{"query plus queries dedup", `{"search":true,"query":"A","queries":["A","B"]}`, []string{"A", "B"}, true},
-		{"caps at three", `{"search":true,"queries":["1","2","3","4"]}`, []string{"1", "2", "3"}, true},
-		{"no search", `{"search":false}`, nil, false},
-		{"missing query", `{"search":true}`, nil, false},
-		{"garbage", "我觉得不用搜", nil, false},
-		{"empty", "", nil, false},
+		{"plain json", `{"search":true,"query":"上海 天气"}`, []string{"上海 天气"}, true, true},
+		{"code fence", "```json\n{\"search\":true,\"query\":\"GPT-5 发布\"}\n```", []string{"GPT-5 发布"}, true, true},
+		{"multi queries", `{"search":true,"queries":["上海 天气","上海 降雨"]}`, []string{"上海 天气", "上海 降雨"}, true, true},
+		{"query plus queries dedup", `{"search":true,"query":"A","queries":["A","B"]}`, []string{"A", "B"}, true, true},
+		{"caps at three", `{"search":true,"queries":["1","2","3","4"]}`, []string{"1", "2", "3"}, true, true},
+		{"no search", `{"search":false}`, nil, false, true},
+		{"missing query", `{"search":true}`, nil, false, false},
+		{"garbage", "我觉得不用搜", nil, false, false},
+		{"empty", "", nil, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			qs, need := parseAutoSearchDecision(tc.raw)
-			if need != tc.need {
-				t.Fatalf("need = %v, want %v", need, tc.need)
+			qs, need, ok := parseAutoSearchDecision(tc.raw)
+			if need != tc.need || ok != tc.ok {
+				t.Fatalf("need, ok = %v %v, want %v %v", need, ok, tc.need, tc.ok)
 			}
 			if len(qs) != len(tc.queries) {
 				t.Fatalf("queries = %#v, want %#v", qs, tc.queries)
@@ -76,9 +83,9 @@ func TestParseAutoSearchDecision(t *testing.T) {
 
 func TestParseAutoSearchDecisionTruncatesLongQuery(t *testing.T) {
 	long := strings.Repeat("词", 120)
-	qs, need := parseAutoSearchDecision(`{"search":true,"queries":["` + long + `"]}`)
-	if !need || len(qs) != 1 {
-		t.Fatalf("unexpected decision: %#v %v", qs, need)
+	qs, need, ok := parseAutoSearchDecision(`{"search":true,"queries":["` + long + `"]}`)
+	if !need || !ok || len(qs) != 1 {
+		t.Fatalf("unexpected decision: %#v %v %v", qs, need, ok)
 	}
 	if n := len([]rune(qs[0])); n != autoSearchMaxQuery {
 		t.Fatalf("truncated query runes = %d, want %d", n, autoSearchMaxQuery)
@@ -114,6 +121,33 @@ func TestAutoSearchPromptInjectsDistilledContext(t *testing.T) {
 	}
 	if !strings.Contains(ag.prompts[1], "网页正文") {
 		t.Fatalf("digest prompt should carry fetched page text: %q", ag.prompts[1])
+	}
+}
+
+func TestAutoSearchPromptFallsBackWhenRouterFails(t *testing.T) {
+	old := agent.PageTextFetcher
+	agent.PageTextFetcher = func(_ context.Context, _ string, _ int) (string, error) {
+		return "", errors.New("page blocked")
+	}
+	defer func() { agent.PageTextFetcher = old }()
+
+	searcher := &fakeSearcher{
+		results: []agent.SearchResult{{Title: "玄鉴仙族", URL: "https://example.com/x", Content: "仙基与果位设定"}},
+		answer:  "小说设定资料",
+	}
+	h := &Handler{webSearch: searcher, autoSearch: true}
+	ag := &fakeCleanAgent{
+		errs:    []error{errors.New("API error HTTP 503")},
+		replies: []string{"提炼后的故事设定。"},
+	}
+
+	question := "玄鉴仙族里所有的仙基和果位名称发给我"
+	got := h.autoSearchPrompt(context.Background(), "u1", question, ag)
+	if !strings.Contains(got, "联网查到的资料") || !strings.Contains(got, "提炼后的故事设定") {
+		t.Fatalf("router failure should still inject search context: %q", got)
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0] != question {
+		t.Fatalf("fallback should search the raw question, got %#v", searcher.queries)
 	}
 }
 
