@@ -10,13 +10,16 @@ import (
 func TestWebSearchParse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"answer":"答案在这","results":[{"title":"T1","url":"https://a.example/1","content":"c1"},{"title":"T2","url":"https://a.example/2","content":"c2"}]}`))
+		w.Write([]byte(`{"answer":"答案在这","results":[{"title":"T1","url":"https://a.example/1","content":"c1","raw_content":"全文一"},{"title":"T2","url":"https://a.example/2","content":"c2"}]}`))
 	}))
 	defer srv.Close()
 	w := NewWebSearch("k", srv.URL, 3)
 	ans, res, err := w.Search(context.Background(), "今天天气")
 	if err != nil || ans != "答案在这" || len(res) != 2 || res[0].URL != "https://a.example/1" {
 		t.Fatalf("解析不对: ans=%q res=%+v err=%v", ans, res, err)
+	}
+	if res[0].RawContent != "全文一" {
+		t.Fatalf("raw_content 没解析出来: %+v", res[0])
 	}
 	t.Logf("ok: answer=%q results=%d first=%s", ans, len(res), res[0].Title)
 }

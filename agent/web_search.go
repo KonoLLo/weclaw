@@ -18,9 +18,10 @@ const (
 )
 
 type SearchResult struct {
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	Content string `json:"content"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Content    string `json:"content"`
+	RawContent string `json:"raw_content,omitempty"`
 }
 
 // Searcher is the common surface for /s providers.
@@ -61,11 +62,12 @@ func (w *WebSearch) Search(ctx context.Context, query string) (string, []SearchR
 		return "", nil, fmt.Errorf("查询词是空的")
 	}
 	body, _ := json.Marshal(map[string]any{
-		"api_key":        w.apiKey,
-		"query":          q,
-		"search_depth":   "basic",
-		"include_answer": true,
-		"max_results":    w.maxResults,
+		"api_key":             w.apiKey,
+		"query":               q,
+		"search_depth":        "basic",
+		"include_answer":      true,
+		"include_raw_content": true,
+		"max_results":         w.maxResults,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.endpoint, bytes.NewReader(body))
 	if err != nil {

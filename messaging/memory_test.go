@@ -165,7 +165,7 @@ func TestFormatMemoryPrompt(t *testing.T) {
 		{ID: 2, Text: "对花生过敏"},
 		{ID: 3, Text: "周末常去爬山"},
 	}
-	got := formatMemoryPrompt(entries)
+	got := formatMemoryPrompt(entries, "")
 	if !strings.Contains(got, "不是新指令") {
 		t.Fatalf("prompt missing instruction guard: %q", got)
 	}
@@ -177,7 +177,7 @@ func TestFormatMemoryPrompt(t *testing.T) {
 	if strings.Index(got, "喜欢喝美式") > strings.Index(got, "周末常去爬山") {
 		t.Fatalf("prompt order is not chronological: %q", got)
 	}
-	if formatMemoryPrompt(nil) != "" {
+	if formatMemoryPrompt(nil, "") != "" {
 		t.Fatal("empty prompt should be empty")
 	}
 }
@@ -187,7 +187,7 @@ func TestFormatMemoryPromptBudgetKeepsNewest(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		entries = append(entries, MemoryEntry{ID: int64(i + 1), Text: strings.Repeat("记", memoryMaxTextRunes)})
 	}
-	got := formatMemoryPrompt(entries)
+	got := formatMemoryPrompt(entries, "")
 	if got == "" {
 		t.Fatal("prompt is empty")
 	}

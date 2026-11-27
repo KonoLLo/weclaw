@@ -59,20 +59,20 @@ func detectSearchRequest(text string) (string, bool) {
 }
 
 // chineseSearchSummary asks the current default model to turn the search
-// answer plus result titles/snippets into one short Chinese paragraph.
-// Returns "" when no agent is ready or the call fails, so the caller can
-// fall back to the raw answer.
-func (h *Handler) chineseSearchSummary(ctx context.Context, query, answer string, results []agent.SearchResult) string {
+// bundle (provider answer, snippets and fetched page text) into one Chinese
+// summary. Returns "" when no agent is ready or the call fails, so the
+// caller can fall back to the raw answer.
+func (h *Handler) chineseSearchSummary(ctx context.Context, query string, bundle agent.DeepSearchBundle) string {
 	ag := h.getDefaultAgent()
 	if ag == nil {
 		return ""
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "查询：%s\n", query)
-	if answer != "" {
-		fmt.Fprintf(&sb, "原始摘要：%s\n", answer)
+	if bundle.Answer != "" {
+		fmt.Fprintf(&sb, "原始摘要：%s\n", bundle.Answer)
 	}
-	for i, r := range results {
+	for i, r := range bundle.Results {
 		if i >= 5 {
 			break
 		}
@@ -87,7 +87,22 @@ func (h *Handler) chineseSearchSummary(ctx context.Context, query, answer string
 			fmt.Fprintf(&sb, "- %s\n", title)
 		}
 	}
-	prompt := "把下面的联网搜索结果整理成一段中文摘要，不超过200字，只讲事实，不要编造，不要用Markdown和列表，直接输出摘要正文。涉及价格时统一换算成人民币并用“元”表述，外币按近期汇率约算，不要只给港元、美元等外币数字：\n\n" + sb.String()
+	pages := 0
+	for _, r := range bundle.Results {
+		if pages >= 2 {
+			break
+		}
+		text := strings.TrimSpace(bundle.Pages[r.URL])
+		if text == "" {
+			continue
+		}
+		if utf8.RuneCountInString(text) > 900 {
+			text = string([]rune(text)[:900]) + "…"
+		}
+		fmt.Fprintf(&sb, "〔网页正文（%s）〕%s\n", r.Title, text)
+		pages++
+	}
+	prompt := "把下面的联网搜索结果和网页正文整理成一段中文内容，不超过400字，只讲事实，不要编造，不要用Markdown和列表，直接输出正文。保留关键数字、时间和人名。涉及价格时统一换算成人民币并用“元”表述，外币按近期汇率约算，不要只给港元、美元等外币数字：\n\n" + sb.String()
 	sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	var out string
@@ -104,8 +119,8 @@ func (h *Handler) chineseSearchSummary(ctx context.Context, query, answer string
 		return ""
 	}
 	out = strings.TrimSpace(MarkdownToPlainText(out))
-	if utf8.RuneCountInString(out) > 400 {
-		out = string([]rune(out)[:400])
+	if utf8.RuneCountInString(out) > 500 {
+		out = string([]rune(out)[:500])
 	}
 	return out
 }
@@ -124,19 +139,21 @@ func (h *Handler) handleSearchRequest(ctx context.Context, client *ilink.Client,
 	sctx, cancel := context.WithTimeout(ctx, searchDeadline)
 	defer cancel()
 	start := time.Now()
-	answer, results, err := h.webSearch.Search(sctx, query)
+	bundle, err := agent.DeepSearch(sctx, h.webSearch, []string{query}, 4)
 	if err != nil {
 		log.Printf("[search] failed: %v", err)
 		SendTextReply(ctx, client, msg.FromUserID, "这次没搜成："+err.Error(), msg.ContextToken, clientID)
 		return
 	}
-	if summary := h.chineseSearchSummary(sctx, query, answer, results); summary != "" {
+	log.Printf("[search] /s %q via %s: results=%d pages=%d", query, h.webSearch.Name(), len(bundle.Results), len(bundle.Pages))
+	answer := bundle.Answer
+	if summary := h.chineseSearchSummary(sctx, query, bundle); summary != "" {
 		answer = summary
 	} else if answer == "" {
-		answer = fallbackSearchAnswer(results)
+		answer = fallbackSearchAnswer(bundle.Results)
 	}
 	SendTextReply(ctx, client, msg.FromUserID,
-		buildSearchReply(query, answer, results, h.webSearch.Name(), time.Since(start)), msg.ContextToken, clientID)
+		buildSearchReply(query, answer, bundle.Results, h.webSearch.Name(), time.Since(start)), msg.ContextToken, clientID)
 }
 
 // fallbackSearchAnswer keeps /s useful when the summary model times out:

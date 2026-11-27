@@ -98,9 +98,9 @@ func (h *Handler) forgetMemoryByID(userID string, id int64) string {
 	return "已忘记第 " + strconv.FormatInt(id, 10) + " 条。\n\n" + entry.Text
 }
 
-func (h *Handler) memoryPromptFor(userID string) string {
+func (h *Handler) memoryPromptFor(userID, query string) string {
 	if h.memoryStore == nil {
 		return ""
 	}
-	return formatMemoryPrompt(h.memoryStore.List(userID))
+	return formatMemoryPrompt(h.memoryStore.List(userID), query)
 }

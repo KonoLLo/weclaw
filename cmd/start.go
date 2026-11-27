@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -131,6 +133,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if ws := newWebSearch(cfg); ws != nil {
 		handler.SetWebSearch(ws)
 	}
+	handler.SetAutoSearch(!cfg.Search.DisableAuto)
 	if tts := newTTS(); tts != nil {
 		handler.SetTTS(tts)
 	}
@@ -338,21 +341,72 @@ func newWebSearch(cfg *config.Config) agent.Searcher {
 		tavily.Searcher = agent.NewWebSearch(key, cfg.Search.Endpoint, cfg.Search.MaxResults)
 	}
 	providers = append(providers, tavily)
+	braveKey := strings.TrimSpace(cfg.Search.BraveKey)
+	if braveKey == "" {
+		braveKey = os.Getenv("BRAVE_API_KEY")
+	}
+	brave := agent.SearchProvider{Name: "Brave"}
+	if braveKey == "" {
+		brave.Unavailable = "没配 brave_api_key"
+	} else {
+		brave.Searcher = agent.NewBraveSearch(braveKey, "", cfg.Search.MaxResults)
+	}
+	providers = append(providers, brave)
 	pool := agent.NewSearchPool(providers, cfg.Search.Provider)
 	log.Printf("[search] current engine: %s", pool.Name())
 	return pool
 }
 
+// endpointHost normalizes a URL to its lowercase hostname for key matching.
+func endpointHost(endpoint string) string {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// keyForGeneratorEndpoint picks an http agent key that belongs to the same
+// provider as the generator endpoint. Zhipu's image/video APIs share the GLM
+// agent's key, while the default agent (Gemini) key is rejected with 1000.
+// Same-host agents win; the default agent key stays as the legacy fallback.
+func keyForGeneratorEndpoint(cfg *config.Config, endpoint string) string {
+	host := endpointHost(endpoint)
+	if host != "" {
+		if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" && a.APIKey != "" && endpointHost(a.Endpoint) == host {
+			return a.APIKey
+		}
+		names := make([]string, 0, len(cfg.Agents))
+		for name := range cfg.Agents {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			a := cfg.Agents[name]
+			if a.Type == "http" && a.APIKey != "" && endpointHost(a.Endpoint) == host {
+				return a.APIKey
+			}
+		}
+	}
+	if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" {
+		return a.APIKey
+	}
+	return ""
+}
+
 // newImageGen builds the text-to-image generator. The key comes from the
-// image section, else the default http agent's key, else ZHIPU_API_KEY; with
-// none of those the feature stays off rather than failing every draw.
+// image section, else an agent on the same provider host, else the default
+// http agent's key, else ZHIPU_API_KEY; with none of those the feature stays
+// off rather than failing every draw.
 func newImageGen(cfg *config.Config) *agent.ImageGen {
 	ic := cfg.Image
 	key := ic.APIKey
 	if key == "" {
-		if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" {
-			key = a.APIKey
+		endpoint := ic.Endpoint
+		if endpoint == "" {
+			endpoint = agent.DefaultImageEndpoint
 		}
+		key = keyForGeneratorEndpoint(cfg, endpoint)
 	}
 	if key == "" {
 		key = os.Getenv("ZHIPU_API_KEY")
@@ -369,8 +423,9 @@ func newImageGen(cfg *config.Config) *agent.ImageGen {
 }
 
 // newVideoGen builds the text-to-video generator. The key comes from the video
-// section, else the image section, else the default http agent's key, else
-// ZHIPU_API_KEY; with none of those /视频 stays off.
+// section, else the image section, else an agent on the same provider host,
+// else the default http agent's key, else ZHIPU_API_KEY; with none of those
+// /视频 stays off.
 func newVideoGen(cfg *config.Config) *agent.VideoGen {
 	vc := cfg.Video
 	key := vc.APIKey
@@ -378,9 +433,11 @@ func newVideoGen(cfg *config.Config) *agent.VideoGen {
 		key = cfg.Image.APIKey
 	}
 	if key == "" {
-		if a, ok := cfg.Agents[cfg.DefaultAgent]; ok && a.Type == "http" {
-			key = a.APIKey
+		endpoint := vc.Endpoint
+		if endpoint == "" {
+			endpoint = agent.DefaultVideoEndpoint
 		}
+		key = keyForGeneratorEndpoint(cfg, endpoint)
 	}
 	if key == "" {
 		key = os.Getenv("ZHIPU_API_KEY")

@@ -59,10 +59,12 @@ type WorkspaceConfig struct {
 // SearchConfig configures the switchable web-search clients. Provider is the
 // startup default; a saved /se choice wins over it.
 type SearchConfig struct {
-	Provider   string `json:"provider,omitempty"` // "duckduckgo" (default) or "tavily"
-	APIKey     string `json:"api_key,omitempty"`  // Tavily only
-	Endpoint   string `json:"endpoint,omitempty"`
-	MaxResults int    `json:"max_results,omitempty"`
+	Provider    string `json:"provider,omitempty"` // "duckduckgo" (default) or "tavily"
+	APIKey      string `json:"api_key,omitempty"`  // Tavily only
+	BraveKey    string `json:"brave_api_key,omitempty"`
+	DisableAuto bool   `json:"disable_auto,omitempty"` // true = never search before a normal reply
+	Endpoint    string `json:"endpoint,omitempty"`
+	MaxResults  int    `json:"max_results,omitempty"`
 }
 
 // ImageConfig configures the text-to-image generator used by /图 and the

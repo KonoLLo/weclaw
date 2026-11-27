@@ -18,6 +18,19 @@ func (f *fakeSearcher) Search(ctx context.Context, query string) (string, []Sear
 	return "answer", []SearchResult{{Title: "t", URL: "u", Content: "c"}}, nil
 }
 
+func TestSearchKeyAliases(t *testing.T) {
+	cases := map[string]string{
+		"ddg": "duckduckgo", "DuckDuckGo": "duckduckgo",
+		"tavily": "tavily",
+		"br":     "brave", "Brave": "brave",
+	}
+	for in, want := range cases {
+		if got := searchKey(in); got != want {
+			t.Fatalf("searchKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestSearchPoolSwitchAndPersist(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "search.json")
 	ddg := &fakeSearcher{name: "DuckDuckGo"}

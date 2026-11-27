@@ -75,6 +75,8 @@ func searchKey(name string) string {
 		return "duckduckgo"
 	case "tavily":
 		return "tavily"
+	case "brave", "br":
+		return "brave"
 	}
 	return k
 }

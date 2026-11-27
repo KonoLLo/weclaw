@@ -46,10 +46,12 @@ type Handler struct {
 	pendingFiles  sync.Map          // map[userID]pendingIncomingFile — last upload waiting for a question
 	cronStore     *CronStore        // cron job store (nil if not configured)
 	memoryStore   *MemoryStore      // long-term per-user notes (nil = disabled)
+	memoryLearn   *memoryLearner    // background chat-memory extractor (nil = disabled)
 	allowedUsers  []string          // when non-empty, only these WeChat user IDs are served
 	imageGen      *agent.ImageGen   // text-to-image generator (nil = /图 disabled)
 	videoGen      *agent.VideoGen   // text-to-video generator (nil = /视频 disabled)
 	webSearch     agent.Searcher    // DuckDuckGo or Tavily (nil = disabled)
+	autoSearch    bool              // search the web before normal replies
 	tts           *agent.TTS        // edge-tts client (nil = voice disabled)
 	workspace     *WorkspaceManager // per-user code workspace (nil = disabled)
 
@@ -112,6 +114,8 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 		agentWorkDirs: make(map[string]string),
 		factory:       factory,
 		saveDefault:   saveDefault,
+		memoryLearn:   newMemoryLearner(),
+		autoSearch:    true,
 	}
 }
 
@@ -127,6 +131,9 @@ func (h *Handler) SetVideoGen(g *agent.VideoGen) { h.videoGen = g }
 
 // SetWebSearch enables /s and the search keywords.
 func (h *Handler) SetWebSearch(w agent.Searcher) { h.webSearch = w }
+
+// SetAutoSearch toggles the search-before-reply behaviour.
+func (h *Handler) SetAutoSearch(on bool) { h.autoSearch = on }
 
 // SetTTS enables /语音 and the voice keywords (nil = disabled).
 func (h *Handler) SetTTS(t *agent.TTS) { h.tts = t }
@@ -915,6 +922,7 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, client *ili
 func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, client *ilink.Client, msg ilink.WeixinMessage, message string, attachments []agent.Attachment) (string, error) {
 	info := ag.Info()
 	userID := msg.FromUserID
+	rawUserMessage := message
 	taskCtx, finish := h.beginTask(ctx, userID, "AI 回复", func(stopCtx context.Context) {
 		if canceller, ok := ag.(agent.TurnCanceler); ok {
 			if cancelErr := canceller.CancelTurn(stopCtx, userID); cancelErr != nil {
@@ -946,9 +954,13 @@ func (h *Handler) chatWithAgentAttachments(ctx context.Context, ag agent.Agent, 
 	}
 
 	if strings.TrimSpace(message) != "" && !strings.HasPrefix(strings.TrimSpace(message), "/") {
-		if mem := h.memoryPromptFor(userID); mem != "" {
+		h.maybeLearnFromMessage(userID, rawUserMessage, ag)
+		if mem := h.memoryPromptFor(userID, rawUserMessage); mem != "" {
 			message = mem + "\n\n" + message
 			log.Printf("[memory] injected saved notes for %s", userID)
+		}
+		if web := h.autoSearchPrompt(taskCtx, userID, rawUserMessage, ag); web != "" {
+			message = web + "\n\n" + message
 		}
 		if quotePrompt, quoteAttachments := h.quoteContextForMessage(taskCtx, client, msg); quotePrompt != "" {
 			message = quotePrompt + "\n\n" + message
@@ -1254,8 +1266,9 @@ func buildHelpText() string {
 每天下午5点提醒我写日报 - 重复自然语言提醒
 
 【长期记忆】
-/记住 <内容> - 保存长期记忆（最多 200 条）
-/记忆 [页码] - 查看已保存的记忆（每页 10 条）
+我会边聊边记住你的称呼、偏好、说话习惯和正在忙的事；标 [自动] 的是自己记下的
+/记住 <内容> - 手动保存长期记忆（最多 200 条）
+/记忆 [页码] - 查看记忆（每页 10 条）
 /忘记 <编号|关键词> - 删除一条记忆
 
 【阅读与文件】
@@ -1271,7 +1284,8 @@ func buildHelpText() string {
 
 【搜索与模型】
 /s <关键词> 或 搜一下… - 联网搜索（默认 DuckDuckGo）
-/se [list|N|name] - 查看或切换搜索引擎
+普通聊天也会自动判断要不要联网，需要就先搜再答
+/se [list|N|name] - 查看或切换搜索引擎（DuckDuckGo / Tavily / Brave）
 /gm - 切到 Gemini，再发 /mod 选免费型号
 /mod [list|N|name] - 查看或切换模型（仅 HTTP 助手）
 /mod-t - 测试当前可用模型
@@ -1490,7 +1504,7 @@ func (h *Handler) handleVideoMessage(ctx context.Context, client *ilink.Client, 
 	rememberInboundMedia(client.BotID(), msg, filePath, "video/mp4", fileName)
 
 	if strings.TrimSpace(text) == "" {
-		text = "Please analyze the attached video."
+		text = "请看看这个视频，说说什么内容。"
 	}
 
 	go func() {
@@ -1503,7 +1517,22 @@ func (h *Handler) handleVideoMessage(ctx context.Context, client *ilink.Client, 
 	defaultName := h.defaultName
 	h.mu.RUnlock()
 
-	attachments := []agent.Attachment{{Path: filePath, MIMEType: "video/mp4", Name: fileName}}
+	// HTTP models cannot read an mp4. Extract evenly spaced keyframes and send
+	// them as images; when that fails, answer honestly instead of letting the
+	// model guess from the file name.
+	frameCtx, frameCancel := context.WithTimeout(ctx, videoFrameTimeout)
+	frames, duration, frameTimes, frameErr := extractVideoFrames(frameCtx, filePath, videoFrameMax)
+	frameCancel()
+	var attachments []agent.Attachment
+	if frameErr != nil {
+		log.Printf("[handler] video frame extraction failed for %s: %v", filePath, frameErr)
+		text += "\n\n（用户发来一段视频，但画面没能解析出来。不要猜测视频内容，请如实说没看清，并请他描述一下或截几张图发来。）"
+	} else {
+		attachments = frames
+		defer os.RemoveAll(filepath.Dir(frames[0].Path))
+		text += fmt.Sprintf("\n\n（来自视频的关键帧：视频约 %.0f 秒，以上 %d 张图片按时间顺序抽取，时间点 %s。请结合这些画面回答。）",
+			duration.Seconds(), len(frames), formatFrameTimes(frameTimes))
+	}
 	var reply string
 	if ag := h.getDefaultAgent(); ag != nil {
 		reply, err = h.chatWithAgentAttachments(ctx, ag, client, msg, text, attachments)
