@@ -27,7 +27,7 @@
 
 ## 快速开始
 
-要求：Linux/macOS/Windows，Go 1.25+（源码构建），一个微信 iLink 机器人账号，至少一个 AI Agent（HTTP 接口或 ACP/CLI）。可选 `git`、`edge-tts`、`ffmpeg`（视频理解、语音气泡依赖 ffmpeg）。
+要求：Linux/macOS/Windows，Go 1.25+（源码构建），一个微信账号，至少一个 AI Agent（HTTP 接口或 ACP/CLI）。可选 `git`、`edge-tts`、`ffmpeg`（视频理解、语音气泡依赖 ffmpeg）。
 
 ### 用发行版（Linux）
 
