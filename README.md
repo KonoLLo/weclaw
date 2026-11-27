@@ -274,8 +274,11 @@ Key 优先级：`image.api_key` → 与接口同域名的 HTTP Agent Key（GLM�
 前提：`allowed_users` **必须非空**（只放自己的微信 ID）；空列表时即使 `enabled` 为 true 也不会启用，启动日志会写明原因。只建议在个人服务器上开，不要把接了 shell 的机器人借给别人用。
 
 - 一次只执行一条命令，单条超时 `timeout_seconds`（默认 30 秒）；输出超过 `max_output_kb`（默认 32KB）保留头尾。
-- 黑名单拦截整机级破坏：清根目录、`mkfs`、`dd` 写块设备、关机/重启、fork bomb、删用户组。服务重启、看日志、查容器不受影响。
-- 执行的是 `sh -c`（Windows 是 `cmd /C`），权限就是 weclaw 进程的权限（systemd 下通常是 root）。**不是沙箱**，也不做逐条确认；不想让它动的服务，别把 key/权限交给它，或者保持关闭。
+- 三层安全规则（1.3.2 起）：
+  - **直接拒绝**：清根目录、`mkfs`、`dd` 写块设备、关机/重启、fork bomb、删用户组。
+  - **保护名单（回「确认」也拒绝）**：游戏/数据库/机器人自己的目录与服务（如 `~/.weclaw`、`/opt/qzsz`、`/var/lib/mysql`、`qzsz-server`、`mariadb`、`sing-box`）；`systemctl status` 这类只读操作不受影响。
+  - **待确认**：删除、移动、`kill/pkill`、停/重启服务、清理日志（`journalctl --vacuum`）、`docker rm|prune`、`apt remove`、改防火墙/定时任务、`sed -i`、`chmod -R`、`curl | sh` 等。第一次**不执行**，机器人回复「【需要确认】这条命令还没有执行：<命令原文>」；整句回复「确认」（或「确认执行」/`confirm`）才执行，回复「取消」作废，5 分钟内有效。这段确认提示由程序直接发出，不依赖模型转述（模型曾出现“没执行却编造输出”的情况）。
+- 执行的是 `sh -c`（Windows 是 `cmd /C`），权限就是 weclaw 进程的权限（systemd 下通常是 root）。**不是沙箱**：确认规则基于正则匹配，把命令写进脚本再执行等变形写法可能绕过；不想让它动的服务，别把 key/权限交给它，或者保持关闭。
 
 ### 主动推送与 API
 
@@ -359,7 +362,7 @@ weclaw send --to "wxid_xxx@im.wechat" --text "你好"
 2. HTTP API 无鉴权，默认只听 `127.0.0.1`；改 `0.0.0.0` 前先加反代和鉴权。
 3. `/run`、`server_shell` 和 Agent 的 `--dangerously-skip-permissions` 都不是沙箱，同进程权限执行。
 4. 导入的仓库不可信：会拒绝路径穿越/软链，但代码没做审计，别对陌生仓库开 `/run`。
-5. `server_shell` 只给可信的人开；`allowed_users` 为空时不会启用，但也不要依赖空列表“默认安全”。
+5. `server_shell` 只给可信的人开；`allowed_users` 为空时不会启用，但也不要依赖空列表“默认安全”。二次确认只是防误操作，正则挡不住所有变形写法。
 6. `config.json` 含 Key，保持 `0600`，不进 Git、不发聊天。
 
 ## 数据目录
